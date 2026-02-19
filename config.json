@@ -1,0 +1,53 @@
+{
+  "mode": "simulation",
+  "scan_interval_seconds": 300,
+  "simulation_bankroll": 10000.0,
+  "volume_filter": {
+    "min_volume": 10000,
+    "max_volume": 500000000000
+  },
+  "position_sizing": {
+    "fixed_size_usd": 10.0,
+    "max_position_pct": 0.05,
+    "max_total_exposure_pct": 0.50
+  },
+  "strategies": {
+    "new_market": {
+      "enabled": true,
+      "weight": 2.0,
+      "max_age_hours": 48,
+      "min_edge": 0.05,
+      "preferred_duration_days_min": 7,
+      "preferred_duration_days_max": 120,
+      "take_profit": 0.20,
+      "stop_loss": 0.30
+    },
+    "breakout": {
+      "enabled": true,
+      "weight": 1.5,
+      "threshold_pp": 0.10,
+      "lookback_hours": 24,
+      "hold_hours": 48
+    },
+    "category": {
+      "enabled": true,
+      "weight": 1.0,
+      "bias_overrides": {
+        "politics": 0.026,
+        "crypto": 0.010,
+        "sports": 0.000,
+        "economics": -0.010,
+        "science_tech": 0.005,
+        "entertainment": 0.005,
+        "world_events": 0.000
+      }
+    },
+    "late_stage": {
+      "enabled": true,
+      "weight": 1.5,
+      "days_before_close": 7,
+      "min_move_pp": 0.05,
+      "large_move_pp": 0.15
+    }
+  }
+}

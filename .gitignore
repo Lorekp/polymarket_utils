@@ -1,0 +1,17 @@
+# Virtual Environment
+.venv/
+
+# Sensitive Data & Credentials (CRITICAL)
+api_keys.json
+config.json
+
+# Downloaded Market Data
+*.parquet
+
+# Python Cache Files
+__pycache__/
+*.py[cod]
+
+# IDE and Editor Folders
+.idea/
+.claude/
