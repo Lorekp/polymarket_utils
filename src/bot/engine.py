@@ -285,7 +285,7 @@ class TradingBot:
 
         # Build execution engine
         if self.config.mode == "simulation":
-            self.engine = SimulationEngine(self.config.simulation_bankroll)
+            self.engine = SimulationEngine(self.config.simulation_bankroll, data_service=self.data_service)
         else:
             self.engine = LiveEngine(self.config.private_key, self.config.funder_address)
 
@@ -294,6 +294,7 @@ class TradingBot:
 
         self._running = False
         self._shutdown_event = threading.Event()
+        self._mark_stop = threading.Event()
         self._cycle_count = 0
 
     def _build_strategies(self) -> list[Strategy]:
@@ -344,13 +345,24 @@ class TradingBot:
                 self._cycle_count += 1
                 self._run_cycle()
 
-                # Countdown between scans (refreshes dashboard every second)
+                # Countdown between scans: dashboard redraws every 1s,
+                # background thread refreshes position marks every 5s
                 remaining = self.config.scan_interval_seconds
+                self._mark_stop.clear()
+                mark_thread = None
+                if isinstance(self.engine, SimulationEngine) and self.engine.positions:
+                    mark_thread = threading.Thread(
+                        target=self._background_mark_loop, daemon=True,
+                    )
+                    mark_thread.start()
                 while remaining > 0 and self._running:
                     self._render_dashboard(next_scan_sec=remaining)
                     if self._shutdown_event.wait(timeout=1):
                         break
                     remaining -= 1
+                self._mark_stop.set()
+                if mark_thread is not None:
+                    mark_thread.join(timeout=2)
         finally:
             self._graceful_shutdown()
 
@@ -385,11 +397,17 @@ class TradingBot:
             top_positions=top,
         )
 
+    def _background_mark_loop(self) -> None:
+        """Refresh position marks every 5s in a background thread."""
+        while not self._mark_stop.wait(timeout=5):
+            try:
+                if isinstance(self.engine, SimulationEngine) and self.engine.positions:
+                    self.engine.update_marks_batch(self.data_service)
+            except Exception as e:
+                logger.debug("Background mark refresh failed: %s", e)
+
     def _run_cycle(self) -> None:
         """Execute one scan-evaluate-trade cycle."""
-        # 0. Load candidate markets from file
-
-
         # 1. Scan for candidate markets
         try:
             candidates = self.scanner.scan()
@@ -483,7 +501,11 @@ class TradingBot:
                         position.side == Side.BUY_NO and yes_price <= 0.01
                     )
                     reason = ExitReason.RESOLVED_WIN if won else ExitReason.RESOLVED_LOSS
-                    exit_price = yes_price
+                    # Pass price of the token we hold
+                    if position.side == Side.BUY_YES:
+                        exit_price = yes_price
+                    else:
+                        exit_price = 1.0 - yes_price
                     closed = self.engine.close_position(position, exit_price, reason)
                     self.bot_logger.log("position_closed", **closed.to_dict())
                     self.display.trade_closed(
@@ -498,7 +520,11 @@ class TradingBot:
                 if strategy.name == position.strategy_name:
                     should_close, reason = strategy.should_close(position, snapshot)
                     if should_close and reason is not None:
-                        exit_price = snapshot.price_yes or position.entry_price
+                        # Pass price of the token we hold
+                        if position.side == Side.BUY_YES:
+                            exit_price = snapshot.price_yes or position.entry_price
+                        else:
+                            exit_price = snapshot.price_no or position.entry_price
                         closed = self.engine.close_position(position, exit_price, reason)
                         self.bot_logger.log("position_closed", **closed.to_dict())
                         self.display.trade_closed(

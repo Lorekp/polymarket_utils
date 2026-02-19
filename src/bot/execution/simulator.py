@@ -18,11 +18,12 @@ SLIPPAGE_PCT = 0.005  # 0.5% simulated slippage
 class SimulationEngine(ExecutionEngine):
     """Paper trading engine — tracks hypothetical positions and P&L."""
 
-    def __init__(self, initial_bankroll: float = 10_000.0):
+    def __init__(self, initial_bankroll: float = 10_000.0, data_service: MarketDataService | None = None):
         self.cash = initial_bankroll
         self.initial_bankroll = initial_bankroll
         self.positions: dict[str, Position] = {}  # position_id -> Position
         self.closed_trades: list[ClosedTrade] = []
+        self._data_service = data_service
         self._trade_counter = 0
 
     def execute_trade(
@@ -36,12 +37,20 @@ class SimulationEngine(ExecutionEngine):
             )
             return None
 
-        # Apply simulated slippage
+        # Use live CLOB midpoint when available so entry price and
+        # update_marks() use the same price source (no phantom P&L).
+        # Fall back to the strategy's Gamma-sourced fill_price if the
+        # midpoint call fails.
         raw_price = decision.fill_price
-        if decision.signal.side == Side.BUY_YES:
-            fill_price = raw_price * (1 + SLIPPAGE_PCT)
-        else:
-            fill_price = raw_price * (1 + SLIPPAGE_PCT)
+        if self._data_service is not None:
+            mid = self._data_service.get_midpoint(decision.signal.token_id)
+            if mid is not None:
+                raw_price = mid
+
+        # Apply simulated slippage — raw_price is the midpoint of the
+        # token we're buying (Yes token for BUY_YES, No token for BUY_NO),
+        # so slippage always raises the price we pay.
+        fill_price = raw_price * (1 + SLIPPAGE_PCT)
 
         # Clamp to (0, 1)
         fill_price = max(0.01, min(0.99, fill_price))
@@ -62,7 +71,7 @@ class SimulationEngine(ExecutionEngine):
             size_shares=shares,
             entry_time=datetime.now(timezone.utc),
             strategy_name=decision.signal.strategy_name,
-            current_price=raw_price,
+            current_price=fill_price,
         )
 
         self.cash -= decision.size_usd
@@ -82,15 +91,9 @@ class SimulationEngine(ExecutionEngine):
     def close_position(
         self, position: Position, exit_price: float, reason: ExitReason
     ) -> ClosedTrade:
-        # For BUY_YES: profit = (exit_price - entry_price) * shares
-        # For BUY_NO: we bought the No token, so profit = (exit_price_no - entry_price) * shares
-        # Since exit_price is the Yes price, No price = 1 - exit_price
-        if position.side == Side.BUY_YES:
-            exit_value = position.size_shares * exit_price
-        else:
-            # We hold No tokens; No price = 1 - yes_price
-            exit_value = position.size_shares * (1 - exit_price)
-
+        # exit_price is the price of the token we hold (Yes price for
+        # BUY_YES, No price for BUY_NO) — same convention as entry_price.
+        exit_value = position.size_shares * exit_price
         realized_pnl = exit_value - position.size_usd
 
         # For resolution: if we won, the token is worth $1; if lost, $0
@@ -134,15 +137,33 @@ class SimulationEngine(ExecutionEngine):
         return closed
 
     def update_marks(self, data_service: MarketDataService) -> None:
-        """Mark all open positions to market."""
+        """Mark all open positions to market.
+
+        pos.token_id is already the token we hold (Yes token for BUY_YES,
+        No token for BUY_NO), so the midpoint is directly comparable to
+        entry_price in both cases — no 1-mid conversion needed.
+        """
         for pos in self.positions.values():
             mid = data_service.get_midpoint(pos.token_id)
             if mid is not None:
                 pos.current_price = mid
-                if pos.side == Side.BUY_YES:
-                    pos.unrealized_pnl = (mid - pos.entry_price) * pos.size_shares
-                else:
-                    pos.unrealized_pnl = ((1 - mid) - pos.entry_price) * pos.size_shares
+                pos.unrealized_pnl = (mid - pos.entry_price) * pos.size_shares
+
+    def update_marks_batch(self, data_service: MarketDataService) -> None:
+        """Mark all open positions using a single batch midpoints call.
+
+        Used by the background refresh thread between cycles so it
+        doesn't block the countdown loop or pollute the sync rate limiter.
+        """
+        if not self.positions:
+            return
+        token_ids = [pos.token_id for pos in self.positions.values()]
+        mids = data_service.get_midpoints_batch(token_ids)
+        for pos in self.positions.values():
+            mid = mids.get(pos.token_id)
+            if mid is not None:
+                pos.current_price = mid
+                pos.unrealized_pnl = (mid - pos.entry_price) * pos.size_shares
 
     def get_open_positions(self) -> list[Position]:
         return list(self.positions.values())

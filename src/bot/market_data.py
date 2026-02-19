@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -77,7 +78,9 @@ def _extract_token_ids(market: GammaMarket) -> tuple[str | None, str | None]:
 class MarketDataService:
     """Fetches market data from Gamma API and CLOB public endpoints."""
 
-    CLOB_RATE = 30  # conservative for bot scanning (well under 100/s limit)
+    CLOB_RATE = 30  # sync rate (kept for remaining sync calls)
+    ASYNC_RATE = 80  # async rate: 1000 req/10s limit, target 80 for margin
+    ASYNC_CONCURRENCY = 15  # max parallel connections for batch fetches
     MAX_RETRIES = 3
     RETRY_BASE = 2.0
 
@@ -193,6 +196,36 @@ class MarketDataService:
                 return None
         return None
 
+    def get_midpoints_batch(self, token_ids: list[str]) -> dict[str, float]:
+        """Fetch midpoints for multiple tokens via POST /midpoints.
+
+        Uses the JSON-body variant to avoid URL length limits with large
+        token ID lists.  Chunks into batches of 150 to stay well under
+        any request-size limits.  Bypasses _clob_get / _rate_limit so it
+        doesn't pollute the sync rate limiter state used by the scanner.
+        """
+        if not token_ids:
+            return {}
+        result: dict[str, float] = {}
+        chunk_size = 150
+        for i in range(0, len(token_ids), chunk_size):
+            chunk = token_ids[i : i + chunk_size]
+            try:
+                resp = self.http.post(
+                    f"{CLOB_BASE}/midpoints",
+                    json=[{"token_id": tid} for tid in chunk],
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                for tid, v in data.items():
+                    try:
+                        result[tid] = float(v)
+                    except (ValueError, TypeError):
+                        pass
+            except Exception as e:
+                logger.warning("Batch midpoints chunk failed: %s", e)
+        return result
+
     def get_price_history(
         self,
         token_id: str,
@@ -263,6 +296,98 @@ class MarketDataService:
             snapshot.token_id_yes, start_ts=start_ts, fidelity=60
         )
         snapshot.price_history_24h = history
+
+    # ── Async batch price history ─────────────────────────────────────
+
+    async def _fetch_one_price_history(
+        self,
+        client: httpx.AsyncClient,
+        sem: asyncio.Semaphore,
+        limiter: RateLimiter,
+        token_id: str,
+        start_ts: int | None,
+        fidelity: int,
+    ) -> tuple[str, list[tuple[int, float]]]:
+        """Fetch one token's price history asynchronously."""
+        params: dict = {"market": token_id, "fidelity": fidelity}
+        if start_ts is not None:
+            params["startTs"] = start_ts
+
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            async with sem:
+                await limiter.acquire()
+                try:
+                    resp = await client.get(
+                        f"{CLOB_BASE}/prices-history", params=params
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    if not data or "history" not in data:
+                        return token_id, []
+                    return token_id, [
+                        (int(p["t"]), float(p["p"])) for p in data["history"]
+                    ]
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 429 and attempt < self.MAX_RETRIES:
+                        wait = self.RETRY_BASE * (2 ** attempt)
+                        logger.warning(
+                            "CLOB 429 on %s (attempt %d), backing off %.0fs",
+                            token_id[:16], attempt, wait,
+                        )
+                        await asyncio.sleep(wait)
+                    else:
+                        logger.warning("CLOB prices-history failed for %s: %s",
+                                       token_id[:16], e)
+                        return token_id, []
+                except Exception as e:
+                    if _is_transient(e) and attempt < self.MAX_RETRIES:
+                        await asyncio.sleep(self.RETRY_BASE * attempt)
+                    else:
+                        logger.warning("CLOB prices-history error for %s: %s",
+                                       token_id[:16], e)
+                        return token_id, []
+        return token_id, []
+
+    async def _fetch_price_histories_async(
+        self,
+        requests: list[tuple[str, int | None, int]],
+    ) -> dict[str, list[tuple[int, float]]]:
+        """Fetch multiple price histories concurrently."""
+        sem = asyncio.Semaphore(self.ASYNC_CONCURRENCY)
+        limiter = RateLimiter(rate=self.ASYNC_RATE)
+
+        async with httpx.AsyncClient(
+            http2=True,
+            timeout=httpx.Timeout(30.0),
+            limits=httpx.Limits(
+                max_connections=self.ASYNC_CONCURRENCY + 5,
+                max_keepalive_connections=self.ASYNC_CONCURRENCY,
+            ),
+        ) as client:
+            tasks = [
+                self._fetch_one_price_history(
+                    client, sem, limiter, token_id, start_ts, fidelity
+                )
+                for token_id, start_ts, fidelity in requests
+            ]
+            results = await asyncio.gather(*tasks)
+
+        return {token_id: history for token_id, history in results}
+
+    def fetch_price_histories_batch(
+        self,
+        requests: list[tuple[str, int | None, int]],
+    ) -> dict[str, list[tuple[int, float]]]:
+        """Fetch multiple price histories concurrently (sync entry point).
+
+        Args:
+            requests: list of (token_id, start_ts, fidelity) tuples
+        Returns:
+            dict mapping token_id -> [(unix_ts, price), ...]
+        """
+        if not requests:
+            return {}
+        return asyncio.run(self._fetch_price_histories_async(requests))
 
     def close(self) -> None:
         self.http.close()
