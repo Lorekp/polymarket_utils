@@ -9,6 +9,7 @@ from src.analyzer.components.session_picker import SessionPicker
 from src.analyzer.components.equity_chart import EquityChart
 from src.analyzer.components.stats_panel import StatsPanel
 from src.analyzer.components.trades_table import TradesTable
+from src.analyzer.components.backtest_tab import BacktestTab
 from src.analyzer.data_loader import SessionData
 from src.analyzer.report import generate_report
 
@@ -23,6 +24,7 @@ class SessionAnalyzerApp:
         self.chart = EquityChart()
         self.stats = StatsPanel()
         self.trades = TradesTable()
+        self.backtest = BacktestTab(on_backtest_done=self._on_backtest_done)
         self._current_session: SessionData | None = None
         self._report_status_id: int | str | None = None
 
@@ -65,6 +67,9 @@ class SessionAnalyzerApp:
                 with dpg.tab(label="  Trades  ") as trades_tab:
                     self.trades.build(parent=trades_tab)
 
+                with dpg.tab(label="  Backtest  ") as backtest_tab:
+                    self.backtest.build(parent=backtest_tab)
+
         # Load first session now that all components exist
         self.picker.load_initial()
 
@@ -82,6 +87,10 @@ class SessionAnalyzerApp:
         # Clear any old report status
         if self._report_status_id:
             dpg.set_value(self._report_status_id, "")
+
+    def _on_backtest_done(self, session_id: str) -> None:
+        """Called when a backtest finishes — refresh the session picker."""
+        self.picker._refresh()
 
     def _save_report(self) -> None:
         if self._current_session is None:

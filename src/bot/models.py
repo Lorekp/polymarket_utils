@@ -145,7 +145,7 @@ class Position:
             "entry_price": round(self.entry_price, 4),
             "size_usd": round(self.size_usd, 2),
             "size_shares": round(self.size_shares, 4),
-            "current_price": round(self.current_price, 4) if self.current_price else None,
+            "current_price": round(self.current_price, 4) if self.current_price is not None else None,
             "unrealized_pnl": round(self.unrealized_pnl, 2),
             "strategy": self.strategy_name,
             "entry_time": self.entry_time.isoformat(),
@@ -171,6 +171,18 @@ class ClosedTrade:
     realized_pnl: float
     strategy_name: str
     exit_reason: ExitReason
+
+    _CSV_FIELDS = [
+        "position_id", "market_id", "question", "side",
+        "entry_price", "exit_price", "size_usd", "size_shares",
+        "realized_pnl", "strategy", "exit_reason",
+        "entry_time", "exit_time", "hold_hours",
+    ]
+
+    @classmethod
+    def csv_fieldnames(cls) -> list[str]:
+        """Canonical CSV column order (single source of truth)."""
+        return list(cls._CSV_FIELDS)
 
     def to_dict(self) -> dict:
         return {

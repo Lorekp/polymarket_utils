@@ -199,6 +199,99 @@ def build_unrealized_curve(
     return times, values
 
 
+def compute_backtest_statistics(
+    trades_df: pd.DataFrame,
+    summary: dict,
+    snapshots: list[dict],
+) -> dict:
+    """Return backtest-specific metrics (annualized return, CAGR, etc.).
+
+    Only meaningful when ``summary["config"]["mode"] == "backtest"``.
+    Returns ``{metric_name: (raw_value, formatted_string)}``.
+    """
+    config = summary.get("config", {})
+    perf = summary.get("performance", {})
+    initial_bankroll = perf.get("initial_bankroll", 10000.0)
+    final_value = perf.get("final_portfolio_value", initial_bankroll)
+    total_return_frac = (final_value / initial_bankroll) - 1 if initial_bankroll > 0 else 0.0
+
+    # Backtest duration
+    bt_start_str = config.get("backtest_start")
+    bt_end_str = config.get("backtest_end")
+    if bt_start_str and bt_end_str:
+        try:
+            bt_start = datetime.fromisoformat(bt_start_str)
+            bt_end = datetime.fromisoformat(bt_end_str)
+            bt_days = max((bt_end - bt_start).total_seconds() / 86400, 1)
+        except (ValueError, TypeError):
+            bt_days = 365
+    else:
+        bt_days = 365
+
+    # Annualized return & CAGR
+    if bt_days > 0 and (1 + total_return_frac) > 0:
+        annualized = (1 + total_return_frac) ** (365 / bt_days) - 1
+    else:
+        annualized = 0.0
+    cagr = annualized  # same formula for single-period
+
+    # Max drawdown duration (days between peak and recovery)
+    max_dd_duration_days = 0.0
+    if not trades_df.empty and "exit_time" in trades_df.columns:
+        pnl = trades_df["realized_pnl"]
+        cum = pnl.cumsum()
+        peak = cum.cummax()
+        in_drawdown = cum < peak
+
+        if in_drawdown.any():
+            exit_times = trades_df["exit_time"]
+            dd_start = None
+            longest = 0.0
+            for i in range(len(in_drawdown)):
+                if in_drawdown.iloc[i]:
+                    if dd_start is None:
+                        dd_start = exit_times.iloc[i]
+                else:
+                    if dd_start is not None:
+                        duration = (exit_times.iloc[i] - dd_start).total_seconds() / 86400
+                        longest = max(longest, duration)
+                        dd_start = None
+            # Handle ongoing drawdown at end
+            if dd_start is not None:
+                duration = (exit_times.iloc[-1] - dd_start).total_seconds() / 86400
+                longest = max(longest, duration)
+            max_dd_duration_days = longest
+
+    # Trade frequency (trades per day)
+    n_trades = len(trades_df) if not trades_df.empty else 0
+    trades_per_day = n_trades / bt_days if bt_days > 0 else 0.0
+
+    # Capital utilization (avg exposure / portfolio_value across snapshots)
+    avg_utilization = 0.0
+    if snapshots:
+        utils = []
+        for snap in snapshots:
+            pv = snap.get("portfolio_value", 0)
+            exp = snap.get("total_exposure", 0)
+            if pv > 0:
+                utils.append(exp / pv)
+        avg_utilization = sum(utils) / len(utils) if utils else 0.0
+
+    return {
+        "Annualized Return": (annualized, f"{annualized * 100:+.2f}%"),
+        "CAGR": (cagr, f"{cagr * 100:+.2f}%"),
+        "Max DD Duration": (max_dd_duration_days, f"{max_dd_duration_days:.1f} days"),
+        "Trade Frequency": (trades_per_day, f"{trades_per_day:.2f} / day"),
+        "Capital Utilization": (avg_utilization, f"{avg_utilization * 100:.1f}%"),
+    }
+
+
+_BACKTEST_STAT_NAMES = [
+    "Annualized Return", "CAGR", "Max DD Duration",
+    "Trade Frequency", "Capital Utilization",
+]
+
+
 def compute_strategy_breakdown(trades_df: pd.DataFrame) -> dict[str, dict]:
     """Per-strategy summary table data."""
     if trades_df.empty:

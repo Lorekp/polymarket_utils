@@ -1,12 +1,14 @@
-"""Breakout Follower — exploits post-breakout momentum.
+"""Asymmetric Breakout Strategy — fades upward breakouts, follows downward ones.
 
-When a market moves >=10pp in 24h, the move tends to continue
-in the same direction over the next 48h (>55% continuation rate).
+From 2025 analysis (1.2M breakout events across 33,591 markets):
+- Upward breakouts: only 43.5% continue (56.5% revert), avg post-48h move = -5.78pp.
+  These are overcorrections — fade them by buying NO.
+- Downward breakouts: 77.9% predict correct resolution direction.
+  These are informative — follow them by buying NO (price fell, market resolves NO).
+- Overall continuation: 45% (below random). Symmetric momentum-following is unprofitable.
 """
 
 from __future__ import annotations
-
-from datetime import datetime, timezone
 
 from src.bot.config import BreakoutStrategyConfig
 from src.bot.models import ExitReason, MarketSnapshot, Position, Side, Signal
@@ -26,7 +28,6 @@ def detect_breakout(
     if not history or len(history) < 2:
         return None, None
 
-    # Find max and min prices and compute the range
     prices = [p for _, p in history]
     earliest_price = prices[0]
     latest_price = prices[-1]
@@ -52,7 +53,7 @@ def detect_breakout(
 
 
 class BreakoutFollower(Strategy):
-    """Follow momentum after large price moves."""
+    """Asymmetric breakout: fade upward moves (buy NO), follow downward moves (buy NO)."""
 
     def __init__(self, config: BreakoutStrategyConfig):
         super().__init__("breakout", config.weight)
@@ -72,24 +73,44 @@ class BreakoutFollower(Strategy):
 
         abs_move = abs(move)
 
-        # Scale confidence by breakout magnitude
-        if abs_move >= 0.40:
-            confidence = 0.85
-        elif abs_move >= 0.20:
-            confidence = 0.70
-        else:
-            confidence = 0.50
-
-        # Expected edge: from research, continuation rate is ~55-65%
-        # so edge ≈ (continuation_rate - 0.5) * avg_continuation_magnitude
-        expected_edge = 0.08 * (abs_move / 0.10)  # scales with move size
-
         if direction == "up":
-            side = Side.BUY_YES
-            token_id = snapshot.token_id_yes
-        else:
+            # Upward breakout: fade it (56.5% revert).
+            # Buy NO — betting the upward move was an overcorrection.
             side = Side.BUY_NO
             token_id = snapshot.token_id_no
+
+            # Edge is modest: ~6.5% over random (56.5% - 50%)
+            if abs_move >= 0.40:
+                confidence = 0.60
+            elif abs_move >= 0.20:
+                confidence = 0.50
+            else:
+                confidence = 0.40
+
+            expected_edge = min(0.15, 0.04 * (abs_move / 0.10))
+            reasoning = (
+                f"Upward breakout +{abs_move:.0%} in {self.config.lookback_hours}h — "
+                f"fading (56.5% of upward breakouts revert)"
+            )
+        else:
+            # Downward breakout: follow it (77.9% informative about resolution).
+            # Buy NO — price fell, market likely resolves NO.
+            side = Side.BUY_NO
+            token_id = snapshot.token_id_no
+
+            # Edge is strong: ~27.9% over random (77.9% - 50%)
+            if abs_move >= 0.40:
+                confidence = 0.80
+            elif abs_move >= 0.20:
+                confidence = 0.70
+            else:
+                confidence = 0.55
+
+            expected_edge = min(0.25, 0.10 * (abs_move / 0.10))
+            reasoning = (
+                f"Downward breakout -{abs_move:.0%} in {self.config.lookback_hours}h — "
+                f"following (77.9% of downward breakouts predict resolution)"
+            )
 
         return Signal(
             strategy_name=self.name,
@@ -98,13 +119,11 @@ class BreakoutFollower(Strategy):
             side=side,
             confidence=confidence,
             expected_edge=expected_edge,
-            reasoning=(
-                f"Breakout detected: {direction} {abs_move:.0%} in {self.config.lookback_hours}h, "
-                f"expecting momentum continuation"
-            ),
+            reasoning=reasoning,
             raw_data={
                 "move": round(move, 4),
                 "direction": direction,
+                "action": "fade" if direction == "up" else "follow",
                 "history_points": len(snapshot.price_history_24h),
             },
         )
@@ -126,18 +145,19 @@ class BreakoutFollower(Strategy):
                 return True, ExitReason.RESOLVED_WIN if won else ExitReason.RESOLVED_LOSS
 
         # Time-based exit: close after hold_hours
-        now = datetime.now(timezone.utc)
+        now = snapshot.snapshot_time
         hold_hours = (now - position.entry_time).total_seconds() / 3600
         if hold_hours >= self.config.hold_hours:
             return True, ExitReason.HOLD_EXPIRED
 
-        # Reversal protection: if price reverses by half the threshold
-        current = snapshot.price_yes
+        # Reversal protection: if the held token's price drops by half the threshold
         if position.side == Side.BUY_YES:
-            if current < position.entry_price - (self.config.threshold_pp / 2):
+            current = snapshot.price_yes
+            if current is not None and current < position.entry_price - (self.config.threshold_pp / 2):
                 return True, ExitReason.STOP_LOSS
         else:
-            if current > position.entry_price + (self.config.threshold_pp / 2):
+            current = snapshot.price_no
+            if current is not None and current < position.entry_price - (self.config.threshold_pp / 2):
                 return True, ExitReason.STOP_LOSS
 
         return False, None

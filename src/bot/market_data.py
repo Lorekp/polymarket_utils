@@ -48,6 +48,27 @@ def _extract_tags(market: GammaMarket) -> list[str]:
     return []
 
 
+def _outcome_yes_index(market: GammaMarket) -> int:
+    """Return the index of the "Yes" outcome (0 or 1).
+
+    Used by both ``_extract_token_ids`` and ``build_snapshot`` so that
+    token IDs *and* outcome prices are reordered consistently.
+    """
+    outcomes_raw = market.outcomes
+    if not outcomes_raw:
+        return 0
+
+    try:
+        outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+    except (json.JSONDecodeError, TypeError):
+        return 0
+
+    if len(outcomes) != 2:
+        return 0
+
+    return next((i for i, o in enumerate(outcomes) if str(o).lower() == "yes"), 0)
+
+
 def _extract_token_ids(market: GammaMarket) -> tuple[str | None, str | None]:
     """Extract (yes_token_id, no_token_id) from a GammaMarket.
 
@@ -58,19 +79,7 @@ def _extract_token_ids(market: GammaMarket) -> tuple[str | None, str | None]:
     if not token_ids or len(token_ids) != 2:
         return None, None
 
-    outcomes_raw = market.outcomes
-    if not outcomes_raw:
-        return token_ids[0], token_ids[1]
-
-    try:
-        outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
-    except (json.JSONDecodeError, TypeError):
-        return token_ids[0], token_ids[1]
-
-    if len(outcomes) != 2:
-        return None, None
-
-    yes_idx = next((i for i, o in enumerate(outcomes) if str(o).lower() == "yes"), 0)
+    yes_idx = _outcome_yes_index(market)
     no_idx = 1 - yes_idx
     return token_ids[yes_idx], token_ids[no_idx]
 
@@ -89,6 +98,10 @@ class MarketDataService:
         self.http = httpx.Client(http2=True, timeout=30.0)
         self._limiter_next = 0.0
         self._limiter_interval = 1.0 / self.CLOB_RATE
+
+    def get_current_time(self) -> datetime:
+        """Return the current time.  Overridden by BacktestDataService."""
+        return datetime.now(timezone.utc)
 
     def _rate_limit(self) -> None:
         """Simple synchronous rate limiter for CLOB calls."""
@@ -252,10 +265,20 @@ class MarketDataService:
         tags = _extract_tags(market)
         category = classify_category(tags, market.question or "")
 
-        # Use Gamma-provided prices (avoid extra API call for most markets)
+        # Use Gamma-provided prices (avoid extra API call for most markets).
+        # Reorder to match Yes/No convention (same logic as _extract_token_ids).
         prices = market.outcome_prices
-        price_yes = prices[0] if prices and len(prices) >= 1 else None
-        price_no = prices[1] if prices and len(prices) >= 2 else None
+        if prices and len(prices) >= 2:
+            yes_idx = _outcome_yes_index(market)
+            no_idx = 1 - yes_idx
+            price_yes = prices[yes_idx]
+            price_no = prices[no_idx]
+        elif prices and len(prices) == 1:
+            price_yes = prices[0]
+            price_no = None
+        else:
+            price_yes = None
+            price_no = None
 
         # If no price available from Gamma, try CLOB midpoint
         if price_yes is None:
@@ -283,7 +306,7 @@ class MarketDataService:
             accepting_orders=bool(market.accepting_orders),
             one_day_price_change=market.one_day_price_change,
             one_week_price_change=market.one_week_price_change,
-            outcome_prices=list(prices) if prices else None,
+            outcome_prices=[price_yes, price_no] if price_yes is not None and price_no is not None else None,
         )
 
     def enrich_with_price_history(

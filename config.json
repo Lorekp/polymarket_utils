@@ -4,42 +4,60 @@
   "simulation_bankroll": 10000.0,
   "volume_filter": {
     "min_volume": 10000,
-    "max_volume": 500000000000
+    "max_volume": 500000000000,
+    "max_spread": 0.05
   },
   "position_sizing": {
     "fixed_size_usd": 10.0,
     "max_position_pct": 0.05,
-    "max_total_exposure_pct": 0.50
+    "max_total_exposure_pct": 0.30,
+    "daily_loss_limit_pct": 0.05
+  },
+  "scoring": {
+    "min_days": 0.5,
+    "too_close_factor": 0.05,
+    "long_horizon_days": 90,
+    "long_horizon_floor": 0.05,
+    "no_end_date_factor": 0.1
   },
   "strategies": {
     "new_market": {
       "enabled": true,
-      "weight": 2.0,
+      "weight": 1.0,
       "max_age_hours": 48,
       "min_edge": 0.05,
+      "min_price": 0.35,
+      "max_price": 0.65,
       "preferred_duration_days_min": 7,
       "preferred_duration_days_max": 120,
       "take_profit": 0.20,
       "stop_loss": 0.30
     },
     "breakout": {
-      "enabled": true,
-      "weight": 1.5,
+      "enabled": false,
+      "weight": 1.0,
       "threshold_pp": 0.10,
       "lookback_hours": 24,
       "hold_hours": 48
     },
     "category": {
       "enabled": true,
-      "weight": 1.0,
-      "bias_overrides": {
-        "politics": 0.026,
-        "crypto": 0.010,
-        "sports": 0.000,
-        "economics": -0.010,
-        "science_tech": 0.005,
-        "entertainment": 0.005,
-        "world_events": 0.000
+      "weight": 2.0,
+      "min_abs_bias": 0.03,
+      "min_net_edge": 0.01,
+      "min_composite_score": 0.5,
+      "zone_biases": {
+        "politics": {"unlikely": 0.129, "tossup": 0.084},
+        "science_tech": {"tossup": -0.077, "unlikely": -0.062},
+        "crypto": {"likely": 0.048, "tossup": 0.046}
+      },
+      "half_kelly_fractions": {
+        "politics_unlikely": 0.082,
+        "politics_tossup": 0.070,
+        "science_tech_tossup": 0.066,
+        "science_tech_unlikely": 0.076,
+        "crypto_tossup": 0.030,
+        "crypto_likely": 0.045
       }
     },
     "late_stage": {

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from src.bot.execution.base import ExecutionEngine
+from src.bot.models import ClosedTrade
 
 logger = logging.getLogger(__name__)
 
@@ -43,13 +44,8 @@ class BotLogger:
         closed = engine.get_closed_trades()
 
         if not closed:
-            # Write empty CSV with headers
-            fieldnames = [
-                "position_id", "market_id", "question", "side",
-                "entry_price", "exit_price", "size_usd", "size_shares",
-                "realized_pnl", "strategy", "exit_reason",
-                "entry_time", "exit_time", "hold_hours",
-            ]
+            # Write empty CSV with headers derived from the model
+            fieldnames = list(ClosedTrade.csv_fieldnames())
             with open(csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()

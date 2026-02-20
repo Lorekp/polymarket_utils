@@ -8,7 +8,9 @@ from src.analyzer.components.theme import (
     GREEN_PROFIT, RED_LOSS, TEXT_DIM, YELLOW_ACCENT,
 )
 from src.analyzer.data_loader import SessionData
-from src.analyzer.statistics import compute_statistics, compute_strategy_breakdown
+from src.analyzer.statistics import (
+    compute_statistics, compute_strategy_breakdown, compute_backtest_statistics,
+)
 
 # Layout: rows of 4 metrics each (label, value, label, value)
 _STAT_ROWS = [
@@ -27,11 +29,21 @@ _COLOR_METRICS = {
 _SHARPE_METRICS = {"Sharpe Ratio", "Sortino Ratio"}
 
 
+_BACKTEST_ROWS = [
+    ("Annualized Return", "CAGR", "Trade Frequency", "Capital Utilization"),
+    ("Max DD Duration", None, None, None),
+]
+
+_BACKTEST_COLOR_METRICS = {"Annualized Return", "CAGR"}
+
+
 class StatsPanel:
     def __init__(self) -> None:
         self._text_ids: dict[str, int | str] = {}
         self._strat_container: int | str | None = None
         self._exit_id: int | str | None = None
+        self._bt_header: int | str | None = None
+        self._bt_text_ids: dict[str, int | str] = {}
 
     def build(self, parent: int | str) -> None:
         with dpg.collapsing_header(
@@ -66,6 +78,34 @@ class StatsPanel:
             with dpg.group(horizontal=True):
                 dpg.add_text("Exit Reasons:", color=TEXT_DIM)
                 self._exit_id = dpg.add_text("--")
+
+            # Backtest-specific metrics (hidden until a backtest session is loaded)
+            self._bt_header = dpg.add_collapsing_header(
+                label="  Backtest Metrics", default_open=True, show=False,
+            )
+            with dpg.table(
+                parent=self._bt_header,
+                header_row=False,
+                resizable=False,
+                borders_innerH=False,
+                borders_outerH=False,
+                borders_innerV=False,
+                borders_outerV=False,
+            ):
+                dpg.add_table_column(width_fixed=True, init_width_or_weight=160)
+                dpg.add_table_column(width_fixed=True, init_width_or_weight=220)
+                dpg.add_table_column(width_fixed=True, init_width_or_weight=160)
+                dpg.add_table_column(width_fixed=True, init_width_or_weight=220)
+
+                for row in _BACKTEST_ROWS:
+                    with dpg.table_row():
+                        for name in row:
+                            if name is None:
+                                dpg.add_text("")
+                            else:
+                                with dpg.group(horizontal=True):
+                                    dpg.add_text(f"{name}:", color=TEXT_DIM)
+                                    self._bt_text_ids[name] = dpg.add_text("--")
 
             dpg.add_separator()
 
@@ -112,9 +152,31 @@ class StatsPanel:
                     color=GREEN_PROFIT if val > 0 else RED_LOSS if val < 0 else TEXT_DIM,
                 )
 
+        self._update_backtest_metrics(session_data)
         self._update_strategies(session_data)
 
     # ── private ────────────────────────────────────────────────────────
+    def _update_backtest_metrics(self, session_data: SessionData) -> None:
+        is_backtest = session_data.summary.get("config", {}).get("mode") == "backtest"
+        dpg.configure_item(self._bt_header, show=is_backtest)
+
+        if not is_backtest:
+            return
+
+        bt_stats = compute_backtest_statistics(
+            session_data.trades_df, session_data.summary, session_data.snapshots,
+        )
+        for name, (val, fmt) in bt_stats.items():
+            tid = self._bt_text_ids.get(name)
+            if tid is None:
+                continue
+            dpg.set_value(tid, fmt)
+            if name in _BACKTEST_COLOR_METRICS:
+                dpg.configure_item(
+                    tid,
+                    color=GREEN_PROFIT if val > 0 else RED_LOSS if val < 0 else TEXT_DIM,
+                )
+
     def _update_strategies(self, session_data: SessionData) -> None:
         dpg.delete_item(self._strat_container, children_only=True)
 

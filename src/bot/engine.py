@@ -11,6 +11,7 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from src.bot.config import BotConfig, load_config
 from src.bot.execution.live import LiveEngine
@@ -20,6 +21,7 @@ from src.bot.market_data import MarketDataService
 from src.bot.models import ExitReason, Position, Side
 from src.bot.portfolio import Portfolio
 from src.bot.scanner import MarketScanner
+from src.bot.scoring import ScoringConfig as ScoringDataclass, ScoreResult, score_decision
 from src.bot.strategies.base import Strategy
 from src.bot.strategies.breakout import BreakoutFollower
 from src.bot.strategies.category import CategoryBias
@@ -181,7 +183,7 @@ class _LiveDisplay:
         lines.append("")
 
         # ── header ──
-        now_s = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+        now_s = datetime.now(ZoneInfo("Europe/Berlin")).strftime("%H:%M:%S %Z")
         header = f"  {_bold('POLYMARKET BOT')}  {_dim('|')}  {mode.upper()}  {_dim('|')}  cycle {cycle}  {_dim('|')}  {_dim(now_s)}"
         lines.append(header)
         lines.append(sep)
@@ -290,6 +292,17 @@ class TradingBot:
             self.engine = LiveEngine(self.config.private_key, self.config.funder_address)
 
         self.portfolio = Portfolio(self.engine, self.config.position_sizing)
+
+        # Map Pydantic ScoringConfig → dataclass for scoring module
+        sc = self.config.scoring
+        self.scoring_config = ScoringDataclass(
+            min_days=sc.min_days,
+            too_close_factor=sc.too_close_factor,
+            long_horizon_days=sc.long_horizon_days,
+            long_horizon_floor=sc.long_horizon_floor,
+            no_end_date_factor=sc.no_end_date_factor,
+        )
+
         self.display = _LiveDisplay()
 
         self._running = False
@@ -316,10 +329,10 @@ class TradingBot:
         """Main bot loop. Blocks until Ctrl+C."""
         self._running = True
 
-        # Log session start
+        # Log session start (exclude secrets from the log)
         self.bot_logger.log(
             "session_start",
-            config=self.config.model_dump(),
+            config=self.config.model_dump(exclude={"private_key"}),
             bankroll=self.config.simulation_bankroll,
             mode=self.config.mode,
             strategies=[s.name for s in self.strategies],
@@ -408,6 +421,16 @@ class TradingBot:
 
     def _run_cycle(self) -> None:
         """Execute one scan-evaluate-trade cycle."""
+        # 0. Check daily loss limit — still check exits but don't open new trades
+        if self.portfolio.check_daily_limit():
+            self.display.activity(
+                _yellow("!") if not _UNICODE_OK else "\u26a0\ufe0f",
+                _yellow("Daily loss limit reached — pausing new trades"),
+            )
+            self.bot_logger.log("daily_limit_hit", cycle=self._cycle_count)
+            self._check_exits()
+            return
+
         # 1. Scan for candidate markets
         try:
             candidates = self.scanner.scan()
@@ -423,16 +446,19 @@ class TradingBot:
             candidates=len(candidates),
         )
 
-        # 2. Evaluate and trade
+        # 2. Phase 1: Evaluate ALL candidates → collect scored decisions
         signals_generated = 0
         trades_executed = 0
+        max_spread = self.config.volume_filter.max_spread
+
+        scored: list[tuple[ScoreResult, object, object]] = []  # (result, decision, snapshot)
 
         for snapshot in candidates:
-            # Skip if already have a position in this market
             if self.portfolio.has_position_in_market(snapshot.market_id):
                 continue
+            if snapshot.spread is not None and snapshot.spread > max_spread:
+                continue
 
-            # Evaluate through composite strategy
             decision = self.composite.evaluate(snapshot)
             if decision is None:
                 continue
@@ -440,17 +466,33 @@ class TradingBot:
             signals_generated += 1
             self.bot_logger.log("signal", **decision.signal.to_dict())
 
-            # Risk check
+            result = score_decision(decision, snapshot, self.scoring_config)
+            scored.append((result, decision, snapshot))
+
+        # Phase 2: Sort by score-per-dollar (capital efficiency ranking)
+        # A $500 trade at score 0.055 = 0.00011/$ is less efficient than
+        # a $20 trade at score 0.076 = 0.0038/$. This prevents large trades
+        # from crowding out many small high-quality trades.
+        scored.sort(
+            key=lambda x: x[0].score / max(x[1].size_usd, 1.0),
+            reverse=True,
+        )
+
+        # Phase 3: Greedy fill — try each trade in priority order
+        for result, decision, snapshot in scored:
             if not self.portfolio.can_open_position(decision.size_usd):
                 self.bot_logger.log(
                     "trade_rejected",
                     reason="risk_limit",
                     market_id=snapshot.market_id,
                     size_usd=decision.size_usd,
+                    priority_score=round(result.score, 6),
+                    time_factor=round(result.time_factor, 4),
+                    quality_factor=round(result.quality_factor, 4),
+                    days_until_close=round(result.days_until_close, 2) if result.days_until_close is not None else None,
                 )
-                continue
+                continue  # keep trying — a smaller trade later might fit
 
-            # Execute
             position = self.engine.execute_trade(
                 decision,
                 question=snapshot.question,
@@ -458,7 +500,14 @@ class TradingBot:
             )
             if position:
                 trades_executed += 1
-                self.bot_logger.log("trade_executed", **position.to_dict())
+                self.bot_logger.log(
+                    "trade_executed",
+                    **position.to_dict(),
+                    priority_score=round(result.score, 6),
+                    time_factor=round(result.time_factor, 4),
+                    quality_factor=round(result.quality_factor, 4),
+                    days_until_close=round(result.days_until_close, 2) if result.days_until_close is not None else None,
+                )
                 self.display.trade_opened(position)
 
         # 3. Check exits on open positions
@@ -469,7 +518,13 @@ class TradingBot:
             self.engine.update_marks(self.data_service)
 
         summary = self.portfolio.get_summary()
-        self.bot_logger.log("portfolio_snapshot", cycle=self._cycle_count, **summary)
+        self.bot_logger.log(
+            "portfolio_snapshot",
+            cycle=self._cycle_count,
+            scored_candidates=len(scored),
+            top_score=round(scored[0][0].score, 6) if scored else 0.0,
+            **summary,
+        )
 
         # Add scan summary to activity feed
         self.display.scan_done(len(candidates), signals_generated, trades_executed, exits)
@@ -520,11 +575,15 @@ class TradingBot:
                 if strategy.name == position.strategy_name:
                     should_close, reason = strategy.should_close(position, snapshot)
                     if should_close and reason is not None:
-                        # Pass price of the token we hold
+                        # Pass price of the token we hold.
+                        # Derive No price from Yes when missing.
                         if position.side == Side.BUY_YES:
                             exit_price = snapshot.price_yes or position.entry_price
                         else:
-                            exit_price = snapshot.price_no or position.entry_price
+                            no_price = snapshot.price_no
+                            if no_price is None and snapshot.price_yes is not None:
+                                no_price = 1.0 - snapshot.price_yes
+                            exit_price = no_price or position.entry_price
                         closed = self.engine.close_position(position, exit_price, reason)
                         self.bot_logger.log("position_closed", **closed.to_dict())
                         self.display.trade_closed(
@@ -566,8 +625,8 @@ class TradingBot:
             **summary,
         )
 
-        # Export files
-        config_dict = self.config.model_dump()
+        # Export files (exclude secrets from persisted summary)
+        config_dict = self.config.model_dump(exclude={"private_key"})
         csv_path = self.bot_logger.export_trades_csv(self.engine)
         summary_path = self.bot_logger.export_summary(self.engine, config_dict)
 

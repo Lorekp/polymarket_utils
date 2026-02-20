@@ -21,11 +21,11 @@ class MarketScanner:
         self,
         data_service: MarketDataService,
         config: BotConfig,
-        cache_path: str = "bot_cache/scanner_cache.json",
+        cache_path: str | None = "bot_cache/scanner_cache.json",
     ):
         self.data = data_service
         self.config = config
-        self._cache_path = Path(cache_path)
+        self._cache_path = Path(cache_path) if cache_path is not None else None
 
     def _serialize_snapshot(self, snap: MarketSnapshot) -> dict:
         return {
@@ -88,6 +88,8 @@ class MarketScanner:
 
     def _load_cache(self) -> tuple[dict[str, MarketSnapshot], bool]:
         """Load cached snapshots. Returns (snapshots, is_stale)."""
+        if self._cache_path is None:
+            return {}, False
         if not self._cache_path.exists():
             logger.info("No cache file found at %s, starting fresh", self._cache_path)
             return {}, False
@@ -105,7 +107,7 @@ class MarketScanner:
         if written_at_str:
             try:
                 written_at = datetime.fromisoformat(written_at_str)
-                age_hours = (datetime.now(timezone.utc) - written_at).total_seconds() / 3600
+                age_hours = (self.data.get_current_time() - written_at).total_seconds() / 3600
                 is_stale = age_hours > lookback_hours
             except ValueError:
                 pass
@@ -129,9 +131,11 @@ class MarketScanner:
 
     def _save_cache(self, snapshots: dict[str, MarketSnapshot]) -> None:
         """Atomically write snapshots to cache file."""
+        if self._cache_path is None:
+            return
         self._cache_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "written_at": datetime.now(timezone.utc).isoformat(),
+            "written_at": self.data.get_current_time().isoformat(),
             "markets": {
                 mid: self._serialize_snapshot(snap)
                 for mid, snap in snapshots.items()
@@ -157,7 +161,7 @@ class MarketScanner:
         logger.info("Gamma returned %d active binary markets", len(markets))
 
         snapshots: dict[str, MarketSnapshot] = {}
-        now = datetime.now(timezone.utc)
+        now = self.data.get_current_time()
 
         for market in markets:
             snap = self.data.build_snapshot(market)

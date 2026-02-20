@@ -154,12 +154,15 @@ class SimulationEngine(ExecutionEngine):
 
         Used by the background refresh thread between cycles so it
         doesn't block the countdown loop or pollute the sync rate limiter.
+        Snapshots the positions list to avoid RuntimeError if the main
+        thread adds/removes positions concurrently.
         """
-        if not self.positions:
+        positions_snapshot = list(self.positions.values())
+        if not positions_snapshot:
             return
-        token_ids = [pos.token_id for pos in self.positions.values()]
+        token_ids = [pos.token_id for pos in positions_snapshot]
         mids = data_service.get_midpoints_batch(token_ids)
-        for pos in self.positions.values():
+        for pos in positions_snapshot:
             mid = mids.get(pos.token_id)
             if mid is not None:
                 pos.current_price = mid
@@ -172,8 +175,9 @@ class SimulationEngine(ExecutionEngine):
         return list(self.closed_trades)
 
     def get_portfolio_value(self) -> float:
-        unrealized = sum(p.unrealized_pnl for p in self.positions.values())
-        position_cost = sum(p.size_usd for p in self.positions.values())
+        positions = list(self.positions.values())
+        unrealized = sum(p.unrealized_pnl for p in positions)
+        position_cost = sum(p.size_usd for p in positions)
         return self.cash + position_cost + unrealized
 
     def get_cash(self) -> float:
