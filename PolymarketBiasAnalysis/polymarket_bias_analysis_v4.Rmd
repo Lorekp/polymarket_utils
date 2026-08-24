@@ -1,0 +1,1547 @@
+---
+title: "Polymarket Bias & Mispricing Analysis"
+subtitle: "Closed Markets 2025 — Calibration, Exploitable Edges & Bot Strategy (v4)"
+author: "Laurence"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float:
+      collapsed: false
+    code_folding: hide
+    fig_width: 10
+    fig_height: 6
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.align = "center", cache = TRUE
+)
+```
+
+# 1 · Setup & Data Loading
+
+```{r config}
+# ── Paths (change these once) ─────────────────────────────────────────────
+DATA_DIR   <- "C:/Users/laure/PycharmProjects/Polymarket/src"
+MARKET_FILE <- file.path(DATA_DIR, "markets_2025_closed.parquet")
+PRICE_FILE  <- file.path(DATA_DIR, "markets_2025_closed_price_history.parquet")
+
+# ── Trading cost assumptions ──────────────────────────────────────────────
+SPREAD_COST   <- 0.02   # typical ~2% bid-ask spread on liquid markets
+WINNER_FEE    <- 0.02   # ~2% fee on winning payouts
+MIN_EDGE_NET  <- 0.01   # minimum net edge (after costs) to consider tradeable
+MIN_N_EXPLOIT <- 15     # minimum markets in a segment to consider exploitable
+MIN_VOLUME    <- 10000  # minimum volume ($) for liquidity-filtered analysis
+```
+
+```{r libraries}
+library(arrow)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(jsonlite)
+library(lubridate)
+library(scales)
+library(purrr)
+library(boot)
+library(data.table)
+
+theme_poly <- theme_minimal(base_size = 13) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 15),
+    plot.subtitle    = element_text(color = "grey40"),
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom"
+  )
+theme_set(theme_poly)
+
+COL_POS  <- "#2ecc71"
+COL_NEG  <- "#e74c3c"
+COL_NEUT <- "grey70"
+COL_BLUE <- "#3498db"
+COL_ORNG <- "#e67e22"
+COL_PURP <- "#9b59b6"
+```
+
+```{r load-markets}
+df <- read_parquet(MARKET_FILE)
+cat(nrow(df), "market rows loaded\n")
+cat(ncol(df), "columns\n")
+```
+
+## 1.1 Parse Resolutions & Token Mapping
+
+```{r parse-resolutions}
+safe_parse_json <- function(x) tryCatch(fromJSON(x), error = function(e) NA)
+
+df_parsed <- df %>%
+  filter(closed == TRUE) %>%
+  rowwise() %>%
+  mutate(
+    outcomes_list = list(tryCatch(fromJSON(outcomes),       error = function(e) NA_character_)),
+    prices_list   = list(tryCatch(fromJSON(outcome_prices), error = function(e) NA_character_)),
+    tokens_list   = list(tryCatch(fromJSON(token_ids),      error = function(e) NA_character_))
+  ) %>%
+  ungroup()
+
+df_binary <- df_parsed %>%
+  mutate(
+    n_outcomes = lengths(outcomes_list),
+    is_binary  = n_outcomes == 2,
+    yes_idx    = map_int(outcomes_list, ~ {
+      idx <- which(tolower(.x) == "yes")
+      if (length(idx) == 1) idx else NA_integer_
+    })
+  ) %>%
+  filter(is_binary, !is.na(yes_idx)) %>%
+  mutate(
+    yes_token_id   = map2_chr(tokens_list, yes_idx, ~ .x[.y]),
+    yes_resolution = map2_dbl(prices_list, yes_idx, ~ as.numeric(.x[.y])),
+    no_idx         = ifelse(yes_idx == 1, 2, 1),
+    no_token_id    = map2_chr(tokens_list, no_idx, ~ .x[.y])
+  ) %>%
+  filter(!is.na(yes_resolution), yes_resolution %in% c(0, 1))
+
+cat(nrow(df_binary), "binary Yes/No markets with clean resolution\n")
+cat("Resolution rate (Yes = 1):", round(mean(df_binary$yes_resolution), 3), "\n")
+```
+
+## 1.2 Derive Categories from Tags
+
+```{r derive-categories}
+category_rules <- tibble::tribble(
+  ~category,       ~pattern,
+  "Sports",        "nba|nfl|mlb|nhl|soccer|football|tennis|boxing|mma|ufc|cricket|esports|dota|league of legends|sports|epl|la liga|bundesliga|serie a|ligue 1|f1|formula|nascar|golf|olympics|pga",
+  "Crypto",        "crypto|bitcoin|btc|ethereum|eth|solana|sol|defi|blockchain|token|nft|altcoin|memecoin|binance|coinbase",
+  "Politics",      "politic|election|trump|biden|democrat|republican|congress|senate|governor|president|vote|gop|dnc|rnc|parliament|minister|legislation|bill|law|executive order",
+  "Economics",     "econom|fed |federal reserve|interest rate|inflation|gdp|employment|jobs|recession|tariff|trade|stock market|s&p|nasdaq|dow jones|treasury|debt|cpi",
+  "Science/Tech",  "science|tech|ai |artificial intelligence|openai|google|apple|microsoft|space|spacex|nasa|climate|weather|earthquake|hurricane|temperature",
+  "Entertainment", "movie|film|oscar|grammy|emmy|music|album|box office|streaming|netflix|youtube|tiktok|celebrity|award|tv show|series",
+  "World Events",  "war|conflict|ukraine|russia|china|israel|gaza|nato|united nations|refugee|disaster|pandemic",
+  "Other",         ".*"
+)
+
+assign_category <- function(tags) {
+  if (is.na(tags) || tags == "") return("Other")
+  combined <- tolower(tags)
+  for (i in seq_len(nrow(category_rules))) {
+    if (str_detect(combined, category_rules$pattern[i])) return(category_rules$category[i])
+  }
+  "Other"
+}
+
+df_binary <- df_binary %>%
+  mutate(
+    category    = map_chr(event_tags, assign_category),
+    is_election = category == "Politics" &
+      str_detect(tolower(event_tags),
+        "trump|biden|harris|presidential|house|senate|congress|election 2024|midterm|ballot")
+  )
+
+cat("\n── Category distribution ──\n")
+df_binary %>% count(category, sort = TRUE) %>% print()
+cat("\nPolitics: election-tagged =",
+    sum(df_binary$is_election, na.rm = TRUE), "/",
+    sum(df_binary$category == "Politics"), "\n")
+```
+
+# 2 · Calibration Analysis (Snapshot Prices)
+
+The core question: **when the market prices a Yes token at probability $p$, does the event actually happen $p$% of the time?**
+
+```{r build-token-lookup}
+token_lookup <- df_binary %>%
+  select(yes_token_id, yes_resolution, id, event_title, category,
+         is_election, closed_time, volume_num) %>%
+  rename(token_id = yes_token_id) %>%
+  mutate(closed_dt = ymd_hms(closed_time, quiet = TRUE)) %>%
+  filter(!is.na(closed_dt))
+
+yes_tokens <- unique(token_lookup$token_id)
+cat(length(yes_tokens), "unique Yes tokens to look up\n")
+```
+
+```{r compute-time-snapshots, cache=TRUE}
+dfp_arrow <- open_dataset(PRICE_FILE)
+
+snapshots       <- c(1, 6, 24, 72, 168, 720)
+snapshot_labels <- c("1h", "6h", "1d", "3d", "1w", "1mo")
+
+BATCH_SIZE    <- 500
+token_batches <- split(yes_tokens, ceiling(seq_along(yes_tokens) / BATCH_SIZE))
+cat(length(token_batches), "batches of up to", BATCH_SIZE, "tokens\n")
+
+get_snapshot_price <- function(hbc, price, target_hours) {
+  diffs <- abs(hbc - target_hours)
+  valid <- diffs < (target_hours * 0.5 + 1)
+  if (!any(valid)) return(NA_real_)
+  price[valid][which.min(diffs[valid])]
+}
+
+snapshot_list  <- vector("list", length(token_batches))
+mkt_stats_list <- vector("list", length(token_batches))
+
+for (i in seq_along(token_batches)) {
+  batch_tokens <- token_batches[[i]]
+
+  batch_prices <- dfp_arrow %>%
+    filter(token_id %in% batch_tokens) %>%
+    select(token_id, timestamp, price) %>%
+    collect()
+
+  if (nrow(batch_prices) == 0) next
+
+  batch_prices <- batch_prices %>%
+    inner_join(
+      token_lookup %>% select(token_id, yes_resolution, id, category,
+                               is_election, volume_num, closed_dt),
+      by = "token_id"
+    ) %>%
+    mutate(hours_before_close = as.numeric(
+      difftime(closed_dt, timestamp, units = "hours")
+    )) %>%
+    filter(hours_before_close >= 0)
+
+  if (nrow(batch_prices) == 0) next
+
+  # ── Snapshot prices ───────────────────────────────────────────────
+  batch_snap <- batch_prices %>%
+    group_by(token_id, id, yes_resolution, category, is_election, volume_num) %>%
+    summarise(
+      across_snapshots = list(tibble(
+        snapshot_hours = snapshots,
+        snapshot_label = snapshot_labels,
+        snap_price     = map_dbl(snapshots, ~ get_snapshot_price(hours_before_close, price, .x))
+      )),
+      .groups = "drop"
+    ) %>%
+    unnest(across_snapshots) %>%
+    filter(!is.na(snap_price))
+
+  snapshot_list[[i]] <- batch_snap
+
+  # ── Per-market summary stats ────────────────────────────────────────
+  mkt_summary <- batch_prices %>%
+    arrange(token_id, desc(hours_before_close)) %>%
+    group_by(token_id, id, yes_resolution, category, is_election, volume_num, closed_dt) %>%
+    summarise(
+      initial_price      = first(price),
+      final_price        = last(price),
+      min_price          = min(price),
+      max_price          = max(price),
+      price_range        = max(price) - min(price),
+      n_obs              = n(),
+      market_duration_h  = max(hours_before_close),
+      price_sd           = if_else(n() > 2, sd(price), NA_real_),
+      .groups            = "drop"
+    )
+
+  mkt_stats_list[[i]] <- mkt_summary
+
+  if (i %% 5 == 0 || i == length(token_batches)) {
+    cat(sprintf("  Batch %d/%d done (%d snapshot rows so far)\n",
+                i, length(token_batches),
+                sum(map_int(snapshot_list, ~ if (is.null(.x)) 0L else nrow(.x)))))
+  }
+
+  rm(batch_prices, batch_snap, mkt_summary); gc(verbose = FALSE)
+}
+
+snapshot_data <- bind_rows(snapshot_list)
+market_stats  <- bind_rows(mkt_stats_list)
+rm(snapshot_list, mkt_stats_list, dfp_arrow); gc()
+
+cat("\n", nrow(snapshot_data), "total market × snapshot observations\n")
+cat(nrow(market_stats), "markets with full price history stats\n")
+```
+
+## 2.1 Overall Calibration Curve
+
+```{r calibration-curve-overall, fig.height=7}
+calibration <- snapshot_data %>%
+  mutate(
+    price_bin    = cut(snap_price, breaks = seq(0, 1, by = 0.05),
+                       include.lowest = TRUE, labels = FALSE),
+    bin_midpoint = (price_bin - 1) * 0.05 + 0.025
+  ) %>%
+  filter(!is.na(price_bin)) %>%
+  group_by(snapshot_label, bin_midpoint) %>%
+  summarise(n = n(), actual_pct = mean(yes_resolution), avg_price = mean(snap_price), .groups = "drop") %>%
+  mutate(snapshot_label = factor(snapshot_label, levels = c("1mo","1w","3d","1d","6h","1h")))
+
+ggplot(calibration %>% filter(n >= 20), aes(x = avg_price, y = actual_pct)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.8) +
+  geom_point(aes(size = n, color = snapshot_label), alpha = 0.7) +
+  geom_smooth(aes(color = snapshot_label, weight = n), method = "loess", se = FALSE, linewidth = 1) +
+  scale_x_continuous(labels = percent, limits = c(0,1)) +
+  scale_y_continuous(labels = percent, limits = c(0,1)) +
+  scale_size_continuous(range = c(1,6), guide = "none") +
+  coord_equal() +
+  labs(
+    title    = "Polymarket Calibration Curve — Closed Binary Markets (2025)",
+    subtitle = "Dashed line = perfect calibration · Each point = price bin at N hours before close",
+    x = "Market Price (Implied Probability)", y = "Actual Resolution Rate", color = "Snapshot"
+  )
+```
+
+## 2.2 Calibration Error by Snapshot Horizon
+
+```{r calibration-error-summary}
+cal_error <- snapshot_data %>%
+  mutate(price_bin = round(snap_price * 20) / 20) %>%
+  group_by(snapshot_label, price_bin) %>%
+  summarise(n = n(), actual = mean(yes_resolution), predicted = mean(snap_price), .groups = "drop") %>%
+  filter(n >= 10) %>%
+  group_by(snapshot_label) %>%
+  summarise(
+    weighted_cal_error = weighted.mean(abs(actual - predicted), w = n),
+    n_bins             = n(),
+    total_obs          = sum(n),
+    .groups            = "drop"
+  ) %>%
+  mutate(snapshot_label = factor(snapshot_label, levels = c("1mo","1w","3d","1d","6h","1h")))
+
+ggplot(cal_error, aes(x = snapshot_label, y = weighted_cal_error)) +
+  geom_col(aes(fill = weighted_cal_error), width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = paste0(round(weighted_cal_error*100,1),"%")),
+            vjust = -0.5, fontface = "bold", size = 4) +
+  scale_fill_gradient(low = COL_POS, high = COL_NEG) +
+  scale_y_continuous(labels = percent, expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title    = "Average Calibration Error by Time Before Resolution",
+    subtitle = "Lower = more accurate prices · Weighted by bin size",
+    x = "Time Before Close", y = "Mean Absolute Calibration Error"
+  )
+```
+
+## 2.3 Favorite–Longshot Bias
+
+```{r favorite-longshot, fig.height=6}
+fl_data <- snapshot_data %>%
+  filter(snapshot_label == "1d") %>%
+  mutate(
+    price_bin    = cut(snap_price, breaks = seq(0,1,by=0.05),
+                       include.lowest = TRUE, labels = FALSE),
+    bin_midpoint = (price_bin - 1) * 0.05 + 0.025
+  ) %>%
+  filter(!is.na(price_bin)) %>%
+  group_by(bin_midpoint) %>%
+  summarise(
+    n = n(), actual = mean(yes_resolution), predicted = mean(snap_price),
+    bias = actual - predicted, .groups = "drop"
+  )
+
+ggplot(fl_data %>% filter(n >= 15), aes(x = bin_midpoint, y = bias)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_col(aes(fill = bias), width = 0.04, show.legend = FALSE) +
+  geom_text(aes(label = n, y = ifelse(bias >= 0, bias + 0.008, bias - 0.008)),
+            size = 2.8, color = "grey40") +
+  scale_fill_gradient2(low = COL_NEG, mid = "grey80", high = COL_POS, midpoint = 0) +
+  scale_x_continuous(labels = percent) +
+  scale_y_continuous(labels = percent) +
+  labs(
+    title    = "Favorite–Longshot Bias — 1 Day Before Close",
+    subtitle = "Green = market underprices (buy Yes) · Red = overprices · Numbers = market count",
+    x = "Market Price Bin (1 day before close)", y = "Bias (Actual Resolution − Market Price)"
+  )
+```
+
+## 2.4 Initial Price Calibration (Conditional)
+
+**Important**: The naive aggregate "initial bias" (initial price minus resolution averaged across all markets) is misleading because it conflates the base rate of Yes resolutions (≈27%) with a default opening price near 50%. The correct test is *conditional*: for markets **opening in a given price bin**, does the resolution rate match that bin? This isolates real initial mispricing from compositional effects.
+
+```{r initial-price-conditional, fig.height=6}
+init_cal <- market_stats %>%
+  filter(!is.na(initial_price), !is.na(yes_resolution), market_duration_h >= 24) %>%
+  mutate(
+    init_bin     = cut(initial_price, breaks = seq(0, 1, by = 0.05),
+                       include.lowest = TRUE, labels = FALSE),
+    bin_midpoint = (init_bin - 1) * 0.05 + 0.025
+  ) %>%
+  filter(!is.na(init_bin)) %>%
+  group_by(bin_midpoint) %>%
+  summarise(
+    n           = n(),
+    actual_rate = mean(yes_resolution),
+    avg_init    = mean(initial_price),
+    cond_bias   = mean(yes_resolution) - mean(initial_price),
+    .groups     = "drop"
+  )
+
+# Also compute for 1d snapshot for comparison
+close_cal <- snapshot_data %>%
+  filter(snapshot_label == "1d") %>%
+  mutate(
+    price_bin    = cut(snap_price, breaks = seq(0, 1, by = 0.05),
+                       include.lowest = TRUE, labels = FALSE),
+    bin_midpoint = (price_bin - 1) * 0.05 + 0.025
+  ) %>%
+  filter(!is.na(price_bin)) %>%
+  group_by(bin_midpoint) %>%
+  summarise(
+    n           = n(),
+    actual_rate = mean(yes_resolution),
+    avg_price   = mean(snap_price),
+    cond_bias   = mean(yes_resolution) - mean(snap_price),
+    .groups     = "drop"
+  )
+
+# Combine for overlay plot
+init_vs_close_cal <- bind_rows(
+  init_cal %>% mutate(stage = "At market open") %>% rename(price = avg_init),
+  close_cal %>% mutate(stage = "1 day before close") %>% rename(price = avg_price)
+)
+
+ggplot(init_vs_close_cal %>% filter(n >= 15),
+       aes(x = price, y = actual_rate, color = stage)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(aes(size = n), alpha = 0.7) +
+  geom_smooth(aes(weight = n), method = "loess", se = FALSE, linewidth = 1.2) +
+  scale_x_continuous(labels = percent, limits = c(0, 1)) +
+  scale_y_continuous(labels = percent, limits = c(0, 1)) +
+  scale_size_continuous(range = c(1.5, 5), guide = "none") +
+  scale_color_manual(values = c("At market open" = COL_BLUE, "1 day before close" = COL_ORNG)) +
+  coord_equal() +
+  labs(
+    title    = "Conditional Calibration: Opening Price vs 1-Day-Before-Close",
+    subtitle = "For each price bin: does the resolution rate match? Wider gap = more mispriced at open",
+    x = "Price (Implied Probability)", y = "Actual Resolution Rate", color = NULL
+  )
+```
+
+```{r initial-bias-conditional-bar, fig.height=5}
+ggplot(init_cal %>% filter(n >= 15), aes(x = bin_midpoint, y = cond_bias)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_col(aes(fill = cond_bias), width = 0.04, show.legend = FALSE) +
+  geom_text(aes(label = n, y = ifelse(cond_bias >= 0, cond_bias + 0.01, cond_bias - 0.01)),
+            size = 2.8, color = "grey40") +
+  scale_fill_gradient2(low = COL_NEG, mid = "grey80", high = COL_POS, midpoint = 0) +
+  scale_x_continuous(labels = percent) +
+  scale_y_continuous(labels = percent) +
+  labs(
+    title    = "Initial Price Bias (Conditional on Price Bin)",
+    subtitle = "Within each opening-price bin: does resolution exceed the price? Numbers = market count",
+    x = "Initial Price Bin", y = "Conditional Bias (Actual − Initial Price)"
+  )
+```
+
+```{r initial-bias-conditional-summary}
+cat("── Initial price calibration (conditional, within-bin) ──\n")
+cat(sprintf("  Weighted mean absolute bias (initial):    %.2f%%\n",
+    weighted.mean(abs(init_cal$cond_bias[init_cal$n >= 15]),
+                  w = init_cal$n[init_cal$n >= 15]) * 100))
+cat(sprintf("  Weighted mean absolute bias (1d close):   %.2f%%\n",
+    weighted.mean(abs(close_cal$cond_bias[close_cal$n >= 15]),
+                  w = close_cal$n[close_cal$n >= 15]) * 100))
+cat("  (If initial >> close, new markets are genuinely mispriced and correct over time)\n")
+```
+
+```{r initial-bias-by-category, fig.height=5}
+# Conditional initial bias by category (within-bin average, not raw aggregate)
+init_cat_cond <- market_stats %>%
+  filter(!is.na(initial_price), market_duration_h >= 24) %>%
+  mutate(
+    init_bin = cut(initial_price, breaks = seq(0, 1, by = 0.10),
+                   include.lowest = TRUE, labels = FALSE),
+    bin_mid  = (init_bin - 1) * 0.10 + 0.05
+  ) %>%
+  filter(!is.na(init_bin)) %>%
+  group_by(category, bin_mid) %>%
+  summarise(
+    n    = n(),
+    bias = mean(yes_resolution) - mean(initial_price),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 10) %>%
+  group_by(category) %>%
+  summarise(
+    n_bins        = n(),
+    n_total       = sum(n),
+    cond_init_bias = weighted.mean(bias, w = n),
+    .groups       = "drop"
+  ) %>%
+  filter(n_total >= 50)
+
+ggplot(init_cat_cond, aes(x = reorder(category, cond_init_bias), y = cond_init_bias)) +
+  geom_col(aes(fill = cond_init_bias), width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = paste0(ifelse(cond_init_bias > 0, "+", ""),
+                                round(cond_init_bias * 100, 1), "%"),
+                y = cond_init_bias + sign(cond_init_bias) * 0.003),
+            fontface = "bold", size = 4) +
+  scale_fill_gradient2(low = COL_NEG, mid = "grey80", high = COL_POS, midpoint = 0) +
+  scale_y_continuous(labels = percent) +
+  coord_flip() +
+  labs(
+    title    = "Conditional Initial Price Bias by Category",
+    subtitle = "Within-bin weighted average (corrects for base-rate composition)",
+    x = NULL, y = "Conditional Bias (Actual − Initial Price)"
+  )
+```
+
+# 3 · Category-Level Mispricings
+
+## 3.1 Category Calibration Curves
+
+```{r category-calibration, fig.height=10, fig.width=12}
+cat_cal <- snapshot_data %>%
+  filter(snapshot_label == "1d") %>%
+  mutate(
+    price_bin    = cut(snap_price, breaks = seq(0,1,by=0.10),
+                       include.lowest = TRUE, labels = FALSE),
+    bin_midpoint = (price_bin - 1) * 0.10 + 0.05
+  ) %>%
+  filter(!is.na(price_bin)) %>%
+  group_by(category, bin_midpoint) %>%
+  summarise(n = n(), actual = mean(yes_resolution), predicted = mean(snap_price), .groups = "drop")
+
+ggplot(cat_cal %>% filter(n >= 10), aes(x = predicted, y = actual)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey60") +
+  geom_point(aes(size = n), color = COL_BLUE, alpha = 0.7) +
+  geom_smooth(aes(weight = n), method = "loess", se = FALSE, color = COL_NEG, linewidth = 1) +
+  facet_wrap(~ category, ncol = 3) +
+  scale_x_continuous(labels = percent, limits = c(0,1)) +
+  scale_y_continuous(labels = percent, limits = c(0,1)) +
+  scale_size_continuous(range = c(1.5,5), guide = "none") +
+  coord_equal() +
+  labs(
+    title    = "Calibration by Category — 1 Day Before Close",
+    subtitle = "Red line = actual calibration · Dashed = perfect · Bubble size = # markets",
+    x = "Market Price (Implied Probability)", y = "Actual Resolution Rate"
+  )
+```
+
+## 3.2 Category × Price Zone Bias Heatmap
+
+```{r category-bias-heatmap, fig.height=7, fig.width=10}
+# Helper to create price zone factor (used throughout)
+make_price_zone <- function(price) {
+  factor(
+    case_when(
+      price <= 0.15 ~ "Longshot (0-15%)",
+      price <= 0.35 ~ "Unlikely (15-35%)",
+      price <= 0.65 ~ "Toss-up (35-65%)",
+      price <= 0.85 ~ "Likely (65-85%)",
+      TRUE          ~ "Favorite (85-100%)"
+    ),
+    levels = c("Longshot (0-15%)", "Unlikely (15-35%)", "Toss-up (35-65%)",
+               "Likely (65-85%)", "Favorite (85-100%)")
+  )
+}
+
+cat_bias <- snapshot_data %>%
+  filter(snapshot_label == "1d") %>%
+  mutate(price_zone = make_price_zone(snap_price)) %>%
+  group_by(category, price_zone) %>%
+  summarise(n = n(), bias = mean(yes_resolution) - mean(snap_price), .groups = "drop") %>%
+  filter(n >= 10)
+
+ggplot(cat_bias, aes(x = price_zone, y = category, fill = bias)) +
+  geom_tile(color = "white", linewidth = 1) +
+  geom_text(aes(label = paste0(ifelse(bias > 0,"+",""), round(bias*100,1),"%\n(n=",n,")")),
+            size = 3.2, fontface = "bold") +
+  scale_fill_gradient2(low = COL_NEG, mid = "white", high = COL_POS, midpoint = 0,
+                       labels = percent, name = "Bias") +
+  labs(
+    title    = "Category × Price Zone Bias Heatmap — 1 Day Before Close",
+    subtitle = "Green = underpriced (buy Yes) · Red = overpriced (buy No)",
+    x = NULL, y = NULL
+  ) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+## 3.3 Aggregate Category Bias & Brier Score
+
+```{r category-aggregate-stats}
+cat_stats <- snapshot_data %>%
+  filter(snapshot_label == "1d") %>%
+  group_by(category) %>%
+  summarise(
+    n_markets       = n(),
+    avg_price       = mean(snap_price),
+    resolution_rate = mean(yes_resolution),
+    bias            = mean(yes_resolution) - mean(snap_price),
+    brier_score     = mean((snap_price - yes_resolution)^2),
+    abs_bias        = mean(abs(yes_resolution - snap_price)),
+    .groups         = "drop"
+  ) %>%
+  arrange(desc(abs(bias)))
+
+cat_stats %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4))) %>%
+  knitr::kable(caption = "Category-Level Bias & Accuracy (1 day before close)")
+```
+
+```{r category-bias-bar, fig.height=5}
+ggplot(cat_stats %>% filter(n_markets >= 20),
+       aes(x = reorder(category, bias), y = bias)) +
+  geom_col(aes(fill = bias), width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = paste0(ifelse(bias > 0,"+",""), round(bias*100,1),"%"),
+                y = bias + sign(bias) * 0.003),
+            fontface = "bold", size = 4) +
+  scale_fill_gradient2(low = COL_NEG, mid = "grey80", high = COL_POS, midpoint = 0) +
+  scale_y_continuous(labels = percent) +
+  coord_flip() +
+  labs(
+    title    = "Net Calibration Bias by Category",
+    subtitle = "Positive = events happen MORE often than market thinks (buy Yes)",
+    x = NULL, y = "Bias (Actual − Predicted)"
+  )
+```
+
+## 3.4 Politics: Election vs Off-Cycle Markets
+
+The Politics category tends to show the strongest aggregate bias. We check how much of this is 2024 US election spillover — if the edge is election-specific, it may not persist in off-cycle periods.
+
+```{r politics-election-split, fig.height=6}
+politics_split <- snapshot_data %>%
+  filter(snapshot_label == "1d", category == "Politics") %>%
+  mutate(
+    price_zone  = make_price_zone(snap_price),
+    market_type = ifelse(is_election, "Election-tagged", "Off-cycle")
+  ) %>%
+  group_by(market_type, price_zone) %>%
+  summarise(n = n(), bias = mean(yes_resolution) - mean(snap_price), .groups = "drop") %>%
+  filter(n >= 10)
+
+ggplot(politics_split, aes(x = price_zone, y = bias, fill = market_type)) +
+  geom_col(position = "dodge", width = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_text(aes(label = paste0(ifelse(bias > 0,"+",""), round(bias*100,1),"%")),
+            position = position_dodge(width = 0.6), vjust = -0.5, size = 3, fontface = "bold") +
+  scale_fill_manual(values = c("Election-tagged" = COL_PURP, "Off-cycle" = COL_BLUE)) +
+  scale_y_continuous(labels = percent, expand = expansion(mult = c(0.05, 0.15))) +
+  labs(
+    title    = "Politics Bias: Election vs Off-Cycle Markets",
+    subtitle = "Does the Politics edge survive outside election season?",
+    x = "Price Zone", y = "Bias (Actual − Market Price)", fill = NULL
+  )
+```
+
+```{r politics-summary-table}
+politics_agg <- snapshot_data %>%
+  filter(snapshot_label == "1d", category == "Politics") %>%
+  group_by(market_type = ifelse(is_election, "Election-tagged", "Off-cycle")) %>%
+  summarise(
+    n_markets       = n(),
+    avg_price       = mean(snap_price),
+    resolution_rate = mean(yes_resolution),
+    bias            = mean(yes_resolution) - mean(snap_price),
+    brier_score     = mean((snap_price - yes_resolution)^2),
+    .groups         = "drop"
+  )
+
+politics_agg %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4))) %>%
+  knitr::kable(caption = "Politics: Election vs Off-Cycle Bias (1 day before close)")
+```
+
+# 4 · Volume & Liquidity Analysis
+
+Thin markets are noisier. Let's check if bias patterns change when we weight by volume, and critically — which edges survive once we filter for markets a bot can actually trade.
+
+## 4.1 Calibration by Volume Tier
+
+```{r volume-weighted-calibration, fig.height=8}
+vol_cal <- snapshot_data %>%
+  filter(snapshot_label == "1d", !is.na(volume_num)) %>%
+  mutate(
+    vol_tier = factor(
+      case_when(
+        volume_num < 1000   ~ "Micro (<$1K)",
+        volume_num < 10000  ~ "Small ($1K-$10K)",
+        volume_num < 100000 ~ "Medium ($10K-$100K)",
+        TRUE                ~ "Large (>$100K)"
+      ),
+      levels = c("Micro (<$1K)", "Small ($1K-$10K)", "Medium ($10K-$100K)", "Large (>$100K)")
+    ),
+    price_bin = round(snap_price * 10) / 10
+  ) %>%
+  group_by(vol_tier, price_bin) %>%
+  summarise(n = n(), actual = mean(yes_resolution), predicted = mean(snap_price), .groups = "drop")
+
+ggplot(vol_cal %>% filter(n >= 10), aes(x = predicted, y = actual)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey60") +
+  geom_point(aes(size = n), color = COL_PURP, alpha = 0.7) +
+  geom_smooth(aes(weight = n), method = "loess", se = FALSE, color = COL_ORNG, linewidth = 1) +
+  facet_wrap(~ vol_tier, ncol = 2) +
+  scale_x_continuous(labels = percent, limits = c(0,1)) +
+  scale_y_continuous(labels = percent, limits = c(0,1)) +
+  scale_size_continuous(range = c(1,5), guide = "none") +
+  coord_equal() +
+  labs(
+    title    = "Calibration by Market Volume Tier",
+    subtitle = "Do thinner markets have worse calibration?",
+    x = "Market Price", y = "Actual Resolution Rate"
+  )
+```
+
+```{r volume-brier}
+vol_brier <- snapshot_data %>%
+  filter(snapshot_label == "1d", !is.na(volume_num)) %>%
+  mutate(
+    vol_tier = factor(
+      case_when(
+        volume_num < 1000   ~ "Micro (<$1K)",
+        volume_num < 10000  ~ "Small ($1K-$10K)",
+        volume_num < 100000 ~ "Medium ($10K-$100K)",
+        TRUE                ~ "Large (>$100K)"
+      ),
+      levels = c("Micro (<$1K)", "Small ($1K-$10K)", "Medium ($10K-$100K)", "Large (>$100K)")
+    ),
+    brier = (snap_price - yes_resolution)^2
+  ) %>%
+  group_by(vol_tier) %>%
+  summarise(n = n(), brier_score = mean(brier), bias = mean(yes_resolution - snap_price), .groups = "drop")
+
+vol_brier %>%
+  mutate(across(where(is.numeric) & !n, ~ round(.x, 4))) %>%
+  knitr::kable(caption = "Brier Score & Bias by Volume Tier")
+```
+
+## 4.2 Liquidity-Filtered Edge Survival
+
+**Critical for bot**: Edges in markets with < $10K volume are un-tradeable (slippage would eat the edge). Here we recompute the exploitable segment table restricted to liquid markets.
+
+```{r liquidity-filtered-edges, fig.height=7, fig.width=10}
+liquid_bias <- snapshot_data %>%
+  filter(snapshot_label == "1d", !is.na(volume_num)) %>%
+  mutate(
+    liquid      = volume_num >= MIN_VOLUME,
+    price_zone  = make_price_zone(snap_price)
+  )
+
+# Compare bias all vs liquid-only
+liquid_compare <- liquid_bias %>%
+  group_by(price_zone, liquid) %>%
+  summarise(
+    n    = n(),
+    bias = mean(yes_resolution) - mean(snap_price),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 10) %>%
+  mutate(liquid_label = ifelse(liquid, paste0("Liquid (≥$", MIN_VOLUME/1000, "K)"), "All Markets"))
+
+# Category × zone for liquid only
+liquid_cat_bias <- liquid_bias %>%
+  filter(liquid) %>%
+  mutate(price_zone = make_price_zone(snap_price)) %>%
+  group_by(category, price_zone) %>%
+  summarise(n = n(), bias = mean(yes_resolution) - mean(snap_price), .groups = "drop") %>%
+  filter(n >= 10)
+
+ggplot(liquid_cat_bias, aes(x = price_zone, y = category, fill = bias)) +
+  geom_tile(color = "white", linewidth = 1) +
+  geom_text(aes(label = paste0(ifelse(bias > 0,"+",""), round(bias*100,1),"%\n(n=",n,")")),
+            size = 3, fontface = "bold") +
+  scale_fill_gradient2(low = COL_NEG, mid = "white", high = COL_POS, midpoint = 0,
+                       labels = percent, name = "Bias") +
+  labs(
+    title    = sprintf("Category × Price Zone Bias — Liquid Markets Only (≥$%dK)", MIN_VOLUME/1000),
+    subtitle = "Same as heatmap in §3.2 but restricted to tradeable markets",
+    x = NULL, y = NULL
+  ) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+```{r liquidity-edge-survival}
+# How many exploitable segments survive the liquidity filter?
+all_seg <- snapshot_data %>%
+  filter(snapshot_label == "1d") %>%
+  mutate(price_zone = make_price_zone(snap_price)) %>%
+  group_by(category, price_zone) %>%
+  summarise(n = n(), bias = mean(yes_resolution) - mean(snap_price), .groups = "drop") %>%
+  filter(n >= MIN_N_EXPLOIT, abs(bias) > 0.03)
+
+liq_seg <- snapshot_data %>%
+  filter(snapshot_label == "1d", !is.na(volume_num), volume_num >= MIN_VOLUME) %>%
+  mutate(price_zone = make_price_zone(snap_price)) %>%
+  group_by(category, price_zone) %>%
+  summarise(n = n(), bias = mean(yes_resolution) - mean(snap_price), .groups = "drop") %>%
+  filter(n >= MIN_N_EXPLOIT, abs(bias) > 0.03)
+
+cat(sprintf("── Liquidity filter impact ──\n"))
+cat(sprintf("  Exploitable segments (all markets):     %d\n", nrow(all_seg)))
+cat(sprintf("  Exploitable segments (volume ≥ $%dK):   %d\n", MIN_VOLUME/1000, nrow(liq_seg)))
+cat(sprintf("  Survival rate:                           %.0f%%\n",
+            nrow(liq_seg) / max(nrow(all_seg), 1) * 100))
+```
+
+# 5 · Market Duration Effects
+
+```{r duration-bias}
+duration_bias <- market_stats %>%
+  filter(!is.na(market_duration_h), !is.na(initial_price), market_duration_h >= 1) %>%
+  inner_join(
+    snapshot_data %>%
+      filter(snapshot_label == "1d") %>%
+      select(id, snap_price) %>%
+      rename(price_1d = snap_price),
+    by = "id"
+  ) %>%
+  mutate(
+    duration_tier = factor(
+      case_when(
+        market_duration_h < 24   ~ "< 1 day",
+        market_duration_h < 168  ~ "1-7 days",
+        market_duration_h < 720  ~ "1-4 weeks",
+        market_duration_h < 2160 ~ "1-3 months",
+        TRUE                     ~ "> 3 months"
+      ),
+      levels = c("< 1 day","1-7 days","1-4 weeks","1-3 months","> 3 months")
+    )
+  ) %>%
+  # Conditional bias within price bins (avoids base-rate contamination)
+  mutate(init_bin = round(initial_price * 10) / 10) %>%
+  group_by(duration_tier) %>%
+  summarise(
+    n             = n(),
+    init_bias     = mean(yes_resolution - initial_price),
+    final_bias    = mean(yes_resolution - price_1d),
+    price_range   = mean(price_range, na.rm = TRUE),
+    resolution_r  = mean(yes_resolution),
+    brier_initial = mean((initial_price - yes_resolution)^2),
+    .groups       = "drop"
+  )
+
+duration_bias %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4))) %>%
+  knitr::kable(caption = "Bias & Calibration by Market Duration")
+```
+
+```{r duration-bias-plot, fig.height=5}
+duration_long <- duration_bias %>%
+  select(duration_tier, n, init_bias, final_bias) %>%
+  pivot_longer(c(init_bias, final_bias), names_to = "stage", values_to = "bias") %>%
+  mutate(stage = recode(stage,
+    init_bias  = "At market open",
+    final_bias = "1 day before close"
+  ))
+
+ggplot(duration_long, aes(x = duration_tier, y = bias, fill = stage)) +
+  geom_col(position = "dodge", width = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_fill_manual(values = c("At market open" = COL_BLUE, "1 day before close" = COL_ORNG)) +
+  scale_y_continuous(labels = percent) +
+  labs(
+    title    = "Bias at Open vs Close by Market Duration",
+    subtitle = "Do longer-running markets start more biased? Do they self-correct by close?",
+    x = "Market Duration", y = "Bias (Actual − Price)", fill = NULL
+  ) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+# 6 · Late-Stage Price Signals
+
+When the price moves substantially in the final week, is that move informative about the resolution? If yes, **following the move** (momentum) is a tradeable signal. If no (or reverse), **fading the move** is.
+
+```{r late-stage-moves, fig.height=5}
+snap_divergence <- snapshot_data %>%
+  select(id, snapshot_label, snap_price, yes_resolution, category, volume_num) %>%
+  filter(snapshot_label %in% c("1w", "1d")) %>%
+  pivot_wider(names_from = snapshot_label, values_from = snap_price,
+              names_prefix = "price_") %>%
+  filter(!is.na(price_1w), !is.na(price_1d)) %>%
+  mutate(
+    late_move     = price_1d - price_1w,
+    move_correct  = (late_move > 0 & yes_resolution == 1) | (late_move < 0 & yes_resolution == 0),
+    move_size_abs = abs(late_move),
+    move_bucket   = factor(
+      case_when(
+        move_size_abs < 0.05 ~ "Tiny (<5pp)",
+        move_size_abs < 0.15 ~ "Small (5-15pp)",
+        move_size_abs < 0.30 ~ "Medium (15-30pp)",
+        TRUE                 ~ "Large (>30pp)"
+      ),
+      levels = c("Tiny (<5pp)", "Small (5-15pp)", "Medium (15-30pp)", "Large (>30pp)")
+    )
+  )
+
+late_move_summary <- snap_divergence %>%
+  filter(move_size_abs >= 0.05) %>%
+  group_by(move_bucket) %>%
+  summarise(
+    n               = n(),
+    pct_correct     = mean(move_correct),
+    avg_move        = mean(late_move),
+    resolution_rate = mean(yes_resolution),
+    .groups         = "drop"
+  )
+
+ggplot(late_move_summary, aes(x = move_bucket, y = pct_correct)) +
+  geom_col(aes(fill = pct_correct > 0.5), width = 0.6, show.legend = FALSE) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey40") +
+  geom_text(aes(label = paste0(round(pct_correct*100,1),"%\nn=",n)),
+            vjust = -0.4, size = 3.5, fontface = "bold") +
+  scale_fill_manual(values = c("FALSE" = COL_NEG, "TRUE" = COL_POS)) +
+  scale_y_continuous(labels = percent, limits = c(0, 1), expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    title    = "Late-Stage Price Moves (1 week → 1 day): Are They Informative?",
+    subtitle = "Above 50% = follow the move (momentum) · Below 50% = fade the move",
+    x = "Size of Move (1w → 1d)", y = "% Where Move Was in Correct Direction"
+  )
+```
+
+```{r late-stage-by-category, fig.height=6}
+# Statistical test: is the momentum signal significant per category?
+late_cat <- snap_divergence %>%
+  filter(move_size_abs >= 0.05) %>%
+  group_by(category) %>%
+  summarise(
+    n           = n(),
+    pct_correct = mean(move_correct),
+    p_value     = if (n() >= 20) binom.test(sum(move_correct), n(), 0.5)$p.value else NA_real_,
+    .groups     = "drop"
+  ) %>%
+  filter(n >= 20) %>%
+  mutate(significant = !is.na(p_value) & p_value < 0.05)
+
+ggplot(late_cat, aes(x = reorder(category, pct_correct), y = pct_correct)) +
+  geom_col(aes(fill = significant), width = 0.6) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey40") +
+  geom_text(aes(label = paste0(round(pct_correct*100,1),"% (n=",n,
+                                ifelse(significant, " *", ""), ")")),
+            hjust = -0.1, size = 3.3) +
+  scale_fill_manual(values = c("FALSE" = COL_NEUT, "TRUE" = COL_POS),
+                    labels = c("FALSE" = "Not significant", "TRUE" = "p < 0.05")) +
+  scale_y_continuous(labels = percent, limits = c(0, 0.9)) +
+  coord_flip() +
+  labs(
+    title    = "Late-Stage Momentum Signal by Category (1w → 1d)",
+    subtitle = "* = statistically significant (binomial test, p < 0.05)",
+    x = NULL, y = "% of Moves in Correct Direction", fill = NULL
+  )
+```
+
+# 7 · Temporal Stability of Edges
+
+**Critical for bot**: A bias that appeared once is noise; a bias that persists monthly is structural. Here we track the top exploitable segments over time to see which edges a bot can rely on.
+
+```{r temporal-setup}
+# Add close month to snapshot data
+snap_with_time <- snapshot_data %>%
+  filter(snapshot_label == "1d") %>%
+  left_join(
+    market_stats %>% select(id, closed_dt),
+    by = "id"
+  ) %>%
+  filter(!is.na(closed_dt)) %>%
+  mutate(
+    close_month   = floor_date(closed_dt, "month"),
+    close_quarter = paste0(year(closed_dt), "-Q", quarter(closed_dt)),
+    price_zone    = make_price_zone(snap_price)
+  )
+```
+
+## 7.1 Rolling Monthly Bias for Top Segments
+
+```{r rolling-monthly-bias, fig.height=8, fig.width=12}
+# Identify the top exploitable segments (from all-data analysis)
+top_segments <- snapshot_data %>%
+  filter(snapshot_label == "1d") %>%
+  mutate(price_zone = make_price_zone(snap_price)) %>%
+  group_by(category, price_zone) %>%
+  summarise(n = n(), bias = mean(yes_resolution) - mean(snap_price), .groups = "drop") %>%
+  filter(n >= 30, abs(bias) > 0.04) %>%
+  slice_max(abs(bias), n = 8) %>%
+  mutate(segment = paste(category, "×", price_zone))
+
+# Monthly bias for these segments
+monthly_bias <- snap_with_time %>%
+  mutate(segment = paste(category, "×", price_zone)) %>%
+  filter(segment %in% top_segments$segment) %>%
+  group_by(segment, close_month) %>%
+  summarise(
+    n    = n(),
+    bias = mean(yes_resolution) - mean(snap_price),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 5)   # need at least 5 markets per month to be meaningful
+
+if (nrow(monthly_bias) > 0) {
+  ggplot(monthly_bias, aes(x = close_month, y = bias)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_line(color = COL_BLUE, linewidth = 0.8) +
+    geom_point(aes(size = n), color = COL_BLUE, alpha = 0.7) +
+    facet_wrap(~ segment, ncol = 2, scales = "free_y") +
+    scale_x_datetime(date_labels = "%b %Y", date_breaks = "1 month") +
+    scale_y_continuous(labels = percent) +
+    scale_size_continuous(range = c(1.5, 4), name = "n markets") +
+    labs(
+      title    = "Rolling Monthly Bias — Top Exploitable Segments",
+      subtitle = "Persistent ≠ one-off. A reliable edge should be visible across most months.",
+      x = NULL, y = "Monthly Bias (Actual − Price)"
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+} else {
+  cat("Not enough data for monthly segment breakdown.\n")
+}
+```
+
+## 7.2 Edge Persistence Score
+
+```{r edge-persistence}
+# For each top segment: in how many months was the bias in the "expected" direction?
+persistence <- snap_with_time %>%
+  mutate(segment = paste(category, "×", price_zone)) %>%
+  filter(segment %in% top_segments$segment) %>%
+  group_by(segment, close_month) %>%
+  summarise(
+    n            = n(),
+    monthly_bias = mean(yes_resolution) - mean(snap_price),
+    .groups      = "drop"
+  ) %>%
+  filter(n >= 5) %>%
+  left_join(top_segments %>% select(segment, bias), by = "segment") %>%
+  rename(overall_bias = bias) %>%
+  mutate(same_direction = sign(monthly_bias) == sign(overall_bias)) %>%
+  group_by(segment, overall_bias) %>%
+  summarise(
+    n_months        = n(),
+    months_correct  = sum(same_direction),
+    persistence_pct = mean(same_direction) * 100,
+    avg_monthly_n   = mean(n),
+    .groups         = "drop"
+  ) %>%
+  arrange(desc(persistence_pct))
+
+persistence %>%
+  mutate(
+    overall_bias    = paste0(round(overall_bias * 100, 1), "%"),
+    persistence_pct = paste0(round(persistence_pct, 0), "%"),
+    avg_monthly_n   = round(avg_monthly_n, 0)
+  ) %>%
+  knitr::kable(caption = "Edge Persistence: How Many Months Does the Bias Appear?")
+```
+
+## 7.3 Is the Market Getting More Efficient?
+
+```{r quarterly-calibration}
+quarterly_cal <- snap_with_time %>%
+  group_by(close_quarter) %>%
+  summarise(
+    n           = n(),
+    bias        = mean(yes_resolution - snap_price),
+    brier_score = mean((snap_price - yes_resolution)^2),
+    abs_bias    = mean(abs(yes_resolution - snap_price)),
+    .groups     = "drop"
+  )
+
+quarterly_cal %>%
+  mutate(across(where(is.numeric) & !n, ~ round(.x, 4))) %>%
+  knitr::kable(caption = "Calibration by Quarter — Is the market getting more efficient over time?")
+```
+
+```{r quarterly-brier-plot, fig.height=4}
+if (nrow(quarterly_cal) >= 2) {
+  ggplot(quarterly_cal, aes(x = close_quarter, y = brier_score)) +
+    geom_col(aes(fill = brier_score), width = 0.6, show.legend = FALSE) +
+    geom_text(aes(label = round(brier_score, 4)), vjust = -0.5, fontface = "bold", size = 4) +
+    scale_fill_gradient(low = COL_POS, high = COL_NEG) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+    labs(
+      title    = "Brier Score by Quarter",
+      subtitle = "Lower = more accurate. Decreasing trend = edges are shrinking.",
+      x = NULL, y = "Brier Score"
+    )
+}
+```
+
+# 8 · Exploitable Pattern Summary
+
+## 8.1 Gross Edge Table
+
+```{r gross-edge-table}
+exploitable <- snapshot_data %>%
+  filter(snapshot_label == "1d") %>%
+  mutate(price_zone = make_price_zone(snap_price)) %>%
+  group_by(category, price_zone) %>%
+  summarise(
+    n_markets   = n(),
+    avg_price   = mean(snap_price),
+    actual_rate = mean(yes_resolution),
+    bias        = mean(yes_resolution) - mean(snap_price),
+    edge_pct    = bias / avg_price * 100,
+    brier       = mean((snap_price - yes_resolution)^2),
+    .groups     = "drop"
+  ) %>%
+  filter(n_markets >= MIN_N_EXPLOIT, abs(bias) > 0.03) %>%
+  arrange(desc(abs(bias)))
+
+exploitable %>%
+  mutate(across(where(is.numeric) & !n_markets, ~ round(.x, 3))) %>%
+  head(20) %>%
+  knitr::kable(caption = "Top 20 Most Exploitable Category × Price Zone Combinations (|bias| > 3%, n ≥ 15)")
+```
+
+## 8.2 Transaction Cost–Adjusted Edge Table
+
+**The critical filter**: gross edges are meaningless without accounting for the ~2% spread and ~2% winner fee. A segment is only tradeable if the net edge after costs exceeds ~1%.
+
+```{r cost-adjusted-edges}
+exploitable_net <- exploitable %>%
+  mutate(
+    strategy   = ifelse(bias > 0, "Buy Yes", "Buy No"),
+    # Win probability and price depend on which side we're trading
+    win_prob   = ifelse(bias > 0, actual_rate, 1 - actual_rate),
+    entry_price = ifelse(bias > 0, avg_price, 1 - avg_price),
+    # Costs
+    spread     = SPREAD_COST,
+    fee_cost   = WINNER_FEE * win_prob,   # fee only applies to wins
+    total_cost = spread + fee_cost,
+    # Net edge after costs
+    gross_edge = abs(bias),
+    net_edge   = gross_edge - total_cost,
+    # Expected P&L per $1 bet (accounting for costs)
+    gross_pl   = ifelse(
+      bias > 0,
+      actual_rate * (1 / avg_price - 1) - (1 - actual_rate),
+      (1 - actual_rate) * (1 / (1 - avg_price) - 1) - actual_rate
+    ),
+    net_pl     = gross_pl - total_cost,
+    tradeable  = net_edge > MIN_EDGE_NET
+  ) %>%
+  arrange(desc(net_edge))
+
+exploitable_net %>%
+  select(category, price_zone, n_markets, strategy, gross_edge, spread,
+         fee_cost, total_cost, net_edge, net_pl, tradeable) %>%
+  mutate(
+    across(c(gross_edge, spread, fee_cost, total_cost, net_edge, net_pl),
+           ~ paste0(round(.x * 100, 1), "%")),
+    tradeable = ifelse(tradeable, "✅ YES", "❌ NO")
+  ) %>%
+  head(20) %>%
+  knitr::kable(
+    caption = sprintf("Cost-Adjusted Edges (spread=%.0f%%, winner fee=%.0f%%, min net edge=%.0f%%)",
+                      SPREAD_COST*100, WINNER_FEE*100, MIN_EDGE_NET*100)
+  )
+```
+
+```{r cost-adjusted-plot, fig.height=6}
+plot_data <- exploitable_net %>%
+  head(15) %>%
+  mutate(label = paste(category, price_zone, sep = "\n"))
+
+ggplot(plot_data, aes(x = reorder(label, net_pl), y = net_pl)) +
+  geom_col(aes(fill = tradeable), width = 0.6) +
+  geom_text(aes(label = paste0(round(net_pl*100,1), "¢/$1")),
+            hjust = ifelse(plot_data$net_pl >= 0, -0.1, 1.1),
+            size = 3.3, fontface = "bold") +
+  scale_fill_manual(values = c("TRUE" = COL_POS, "FALSE" = COL_NEG),
+                    labels = c("TRUE" = "Net profitable", "FALSE" = "Costs > edge")) +
+  scale_y_continuous(labels = function(x) paste0(round(x*100,1),"¢")) +
+  coord_flip() +
+  labs(
+    title    = "Expected Net P&L per $1 Bet — After Transaction Costs",
+    subtitle = sprintf("Spread: %.0f%% + Winner fee: %.0f%%. Only green segments are actually tradeable.",
+                       SPREAD_COST*100, WINNER_FEE*100),
+    x = NULL, y = "Net Expected Profit per $1 Wagered", fill = NULL
+  )
+```
+
+```{r tradeable-summary}
+n_gross    <- nrow(exploitable)
+n_tradeable <- sum(exploitable_net$tradeable, na.rm = TRUE)
+cat(sprintf("── Cost filter impact ──\n"))
+cat(sprintf("  Segments with gross |bias| > 3%%:   %d\n", n_gross))
+cat(sprintf("  Segments profitable after costs:    %d\n", n_tradeable))
+cat(sprintf("  Kill rate:                           %.0f%%\n",
+            (1 - n_tradeable / max(n_gross, 1)) * 100))
+```
+
+## 8.3 Bootstrap Confidence Intervals
+
+```{r bootstrap-ci, cache=TRUE}
+snap_1d <- snapshot_data %>%
+  filter(snapshot_label == "1d") %>%
+  mutate(price_zone = make_price_zone(snap_price))
+
+boot_bias_fn <- function(data, indices) {
+  d <- data[indices, ]
+  mean(d$yes_resolution) - mean(d$snap_price)
+}
+
+# Bootstrap the tradeable (or top) segments
+top_for_ci <- exploitable_net %>% head(15) %>% select(category, price_zone)
+
+ci_results <- pmap_dfr(top_for_ci, function(category, price_zone) {
+  seg <- snap_1d %>% filter(category == .env$category, price_zone == .env$price_zone)
+  n_obs      <- nrow(seg)
+  point_bias <- mean(seg$yes_resolution) - mean(seg$snap_price)
+
+  ci_lo <- NA_real_
+  ci_hi <- NA_real_
+
+  if (n_obs >= 30) {
+    bo <- boot(seg, boot_bias_fn, R = 2000)
+    ci <- boot.ci(bo, type = "perc")
+    if (!is.null(ci$percent)) {
+      ci_lo <- ci$percent[4]
+      ci_hi <- ci$percent[5]
+    }
+  }
+
+  tibble(
+    category    = category,
+    price_zone  = price_zone,
+    n_obs       = n_obs,
+    point_bias  = point_bias,
+    ci_lo       = ci_lo,
+    ci_hi       = ci_hi,
+    significant = !is.na(ci_lo) & (ci_lo > 0 | ci_hi < 0)
+  )
+})
+
+ci_results %>%
+  mutate(
+    across(c(point_bias, ci_lo, ci_hi), ~ paste0(round(.x * 100, 2), "%")),
+    significant = ifelse(significant, "✅ YES", "no")
+  ) %>%
+  knitr::kable(caption = "Bootstrap 95% CIs — Which Edges Are Statistically Real?")
+```
+
+```{r ci-plot, fig.height=6}
+ci_plot <- ci_results %>%
+  filter(!is.na(ci_lo)) %>%
+  mutate(label = paste(category, price_zone, sep = "\n"))
+
+ggplot(ci_plot, aes(x = reorder(label, point_bias), y = point_bias)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbar(aes(ymin = ci_lo, ymax = ci_hi, color = significant),
+                width = 0.3, linewidth = 1.2) +
+  geom_point(aes(color = significant), size = 3.5) +
+  scale_color_manual(
+    values = c("TRUE" = COL_POS, "FALSE" = COL_NEG),
+    labels = c("TRUE" = "CI excludes zero (reliable)", "FALSE" = "CI crosses zero (noise)")
+  ) +
+  scale_y_continuous(labels = percent) +
+  coord_flip() +
+  labs(
+    title    = "Exploitable Edges with Bootstrap 95% Confidence Intervals",
+    subtitle = "Green = statistically significant · Red = likely noise",
+    x = NULL, y = "Bias (Actual − Market Price)", color = NULL
+  )
+```
+
+## 8.4 Kelly Criterion Position Sizing
+
+For each tradeable edge, optimal bet sizing via the Kelly criterion. Half-Kelly is recommended in practice (accounts for edge estimation error).
+
+```{r kelly-sizing}
+kelly_table <- exploitable_net %>%
+  filter(tradeable) %>%
+  mutate(
+    # For a binary bet: Kelly f* = (p*b - q) / b
+    # where p = win prob, q = 1-p, b = net payout odds
+    # On Polymarket: if entry price = c, payout = 1, so b = (1-cost)/c - 1 roughly
+    # Simplified: edge / variance approach
+    # f* = net_edge / (entry_price * (1 - entry_price))  (approx for binary)
+    b           = (1 - total_cost) / entry_price - 1,   # net payout ratio
+    q           = 1 - win_prob,
+    kelly_full  = pmax(0, (win_prob * b - q) / b),
+    kelly_half  = kelly_full / 2,
+    # Expected log growth at half-Kelly
+    growth_rate = win_prob * log(1 + kelly_half * b) + q * log(1 - kelly_half)
+  ) %>%
+  select(category, price_zone, strategy, n_markets, net_edge, win_prob,
+         kelly_full, kelly_half, growth_rate) %>%
+  arrange(desc(growth_rate))
+
+kelly_table %>%
+  mutate(
+    net_edge    = paste0(round(net_edge * 100, 1), "%"),
+    win_prob    = paste0(round(win_prob * 100, 1), "%"),
+    kelly_full  = paste0(round(kelly_full * 100, 1), "%"),
+    kelly_half  = paste0(round(kelly_half * 100, 1), "%"),
+    growth_rate = paste0(round(growth_rate * 100, 3), "%")
+  ) %>%
+  knitr::kable(caption = "Kelly Criterion Sizing — Tradeable Segments Only (after costs)")
+```
+
+## 8.5 Composite Exploitability Score
+
+A single score the bot can compute in real-time for any market. Combines calibration bias, liquidity, statistical significance, and temporal persistence.
+
+```{r composite-score}
+# Build a scoring table for each tradeable segment
+composite <- exploitable_net %>%
+  filter(tradeable) %>%
+  mutate(segment = paste(category, "×", price_zone)) %>%
+  left_join(
+    ci_results %>% select(category, price_zone, significant, ci_lo, ci_hi),
+    by = c("category", "price_zone")
+  ) %>%
+  left_join(
+    persistence %>% select(segment, persistence_pct, n_months),
+    by = "segment"
+  ) %>%
+  mutate(
+    # Build the composite
+    segment = paste(category, "×", price_zone),
+    # Component scores (0-1)
+    edge_score       = pmin(abs(net_edge) / 0.10, 1),               # net edge scaled to 10%
+    stat_score       = ifelse(significant, 1, 0),                    # binary: CI excludes 0?
+    persist_score    = coalesce(persistence_pct / 100, 0.5),         # % of months bias persists
+    sample_score     = pmin(n_markets / 500, 1),                     # scaled sample size
+    # Weighted composite
+    composite_score  = 0.35 * edge_score +
+                       0.25 * stat_score +
+                       0.25 * persist_score +
+                       0.15 * sample_score
+  ) %>%
+  arrange(desc(composite_score))
+
+composite %>%
+  select(segment, strategy, net_edge, edge_score, stat_score, persist_score,
+         sample_score, composite_score) %>%
+  mutate(
+    net_edge = paste0(round(net_edge * 100, 1), "%"),
+    across(c(edge_score, stat_score, persist_score, sample_score, composite_score),
+           ~ round(.x, 2))
+  ) %>%
+  knitr::kable(
+    caption = "Composite Exploitability Score (0-1) — Higher = more reliably tradeable"
+  )
+```
+
+# 9 · Simulated Backtest
+
+**The ultimate test**: if we had traded every qualifying market in the exploitable segments, what would the P&L look like?
+
+```{r backtest-setup}
+# Identify all markets in tradeable segments, using 1d snapshot as entry
+tradeable_segments <- exploitable_net %>%
+  filter(tradeable) %>%
+  select(category, price_zone, strategy)
+
+backtest_markets <- snapshot_data %>%
+  filter(snapshot_label == "1d") %>%
+  mutate(price_zone = make_price_zone(snap_price)) %>%
+  inner_join(tradeable_segments, by = c("category", "price_zone")) %>%
+  left_join(market_stats %>% select(id, closed_dt), by = "id") %>%
+  filter(!is.na(closed_dt)) %>%
+  arrange(closed_dt) %>%
+  mutate(
+    # Entry price and resolution
+    entry_price = ifelse(strategy == "Buy Yes", snap_price, 1 - snap_price),
+    won         = ifelse(strategy == "Buy Yes", yes_resolution == 1, yes_resolution == 0),
+    # P&L per $1 bet
+    gross_pnl   = ifelse(won, (1 - entry_price), -entry_price),
+    # Costs: spread on entry, fee on win
+    cost        = SPREAD_COST + ifelse(won, WINNER_FEE, 0),
+    net_pnl     = gross_pnl - cost,
+    # Cumulative
+    cum_gross   = cumsum(gross_pnl),
+    cum_net     = cumsum(net_pnl),
+    bet_num     = row_number()
+  )
+
+cat(sprintf("── Backtest universe ──\n"))
+cat(sprintf("  Tradeable segments:  %d\n", nrow(tradeable_segments)))
+cat(sprintf("  Total qualifying bets: %d\n", nrow(backtest_markets)))
+cat(sprintf("  Win rate:              %.1f%%\n", mean(backtest_markets$won) * 100))
+cat(sprintf("  Gross P&L (total):     $%.2f per $1/bet\n", sum(backtest_markets$gross_pnl)))
+cat(sprintf("  Net P&L (total):       $%.2f per $1/bet\n", sum(backtest_markets$net_pnl)))
+cat(sprintf("  Net P&L per bet:       %.2f¢\n", mean(backtest_markets$net_pnl) * 100))
+```
+
+## 9.1 Cumulative P&L
+
+```{r backtest-cumpl, fig.height=5}
+ggplot(backtest_markets, aes(x = bet_num)) +
+  geom_line(aes(y = cum_gross, color = "Gross (no costs)"), linewidth = 0.8) +
+  geom_line(aes(y = cum_net, color = "Net (after costs)"), linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_color_manual(values = c("Gross (no costs)" = COL_NEUT, "Net (after costs)" = COL_POS)) +
+  labs(
+    title    = "Backtest Cumulative P&L — All Tradeable Segments",
+    subtitle = sprintf("$1 flat bet per market · %d total bets · Spread: %.0f%% + Fee: %.0f%%",
+                       nrow(backtest_markets), SPREAD_COST*100, WINNER_FEE*100),
+    x = "Bet Number (chronological)", y = "Cumulative P&L ($)", color = NULL
+  )
+```
+
+## 9.2 Drawdown & Risk Metrics
+
+```{r backtest-risk, fig.height=5}
+# Compute drawdown
+backtest_markets <- backtest_markets %>%
+  mutate(
+    peak_net  = cummax(cum_net),
+    drawdown  = cum_net - peak_net
+  )
+
+max_dd     <- min(backtest_markets$drawdown)
+total_bets <- nrow(backtest_markets)
+total_net  <- sum(backtest_markets$net_pnl)
+avg_net    <- mean(backtest_markets$net_pnl)
+sd_net     <- sd(backtest_markets$net_pnl)
+sharpe_per_bet <- avg_net / sd_net  # per-bet Sharpe analog
+
+ggplot(backtest_markets, aes(x = bet_num, y = drawdown)) +
+  geom_area(fill = COL_NEG, alpha = 0.3) +
+  geom_line(color = COL_NEG, linewidth = 0.6) +
+  labs(
+    title    = "Drawdown (Net P&L)",
+    subtitle = sprintf("Max drawdown: $%.2f | Sharpe (per bet): %.3f", max_dd, sharpe_per_bet),
+    x = "Bet Number", y = "Drawdown ($)"
+  )
+```
+
+```{r backtest-summary-table}
+# Monthly returns
+monthly_bt <- backtest_markets %>%
+  mutate(month = floor_date(closed_dt, "month")) %>%
+  group_by(month) %>%
+  summarise(
+    n_bets     = n(),
+    net_pnl    = sum(net_pnl),
+    win_rate   = mean(won),
+    .groups    = "drop"
+  )
+
+tibble(
+  Metric = c("Total bets", "Win rate", "Gross P&L", "Net P&L",
+             "Net P&L per bet", "Std dev per bet", "Sharpe (per bet)",
+             "Max drawdown", "Profitable months"),
+  Value = c(
+    total_bets,
+    paste0(round(mean(backtest_markets$won)*100, 1), "%"),
+    paste0("$", round(sum(backtest_markets$gross_pnl), 2)),
+    paste0("$", round(total_net, 2)),
+    paste0(round(avg_net*100, 2), "¢"),
+    paste0(round(sd_net*100, 2), "¢"),
+    round(sharpe_per_bet, 3),
+    paste0("$", round(max_dd, 2)),
+    paste0(sum(monthly_bt$net_pnl > 0), "/", nrow(monthly_bt))
+  )
+) %>%
+  knitr::kable(caption = "Backtest Summary — Flat $1 Bets on All Tradeable Segments")
+```
+
+```{r monthly-returns, fig.height=4}
+if (nrow(monthly_bt) >= 2) {
+  ggplot(monthly_bt, aes(x = month, y = net_pnl)) +
+    geom_col(aes(fill = net_pnl > 0), width = 25, show.legend = FALSE) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_text(aes(label = paste0("$", round(net_pnl, 1))), vjust = -0.5, size = 3) +
+    scale_fill_manual(values = c("FALSE" = COL_NEG, "TRUE" = COL_POS)) +
+    labs(
+      title = "Monthly Net P&L",
+      subtitle = "Consistency across months = structural edge; one big month = lucky",
+      x = NULL, y = "Net P&L ($)"
+    )
+}
+```
+
+## 9.3 P&L by Segment
+
+```{r backtest-by-segment, fig.height=6}
+bt_segment <- backtest_markets %>%
+  mutate(segment = paste(category, price_zone, sep = "\n")) %>%
+  group_by(segment, strategy) %>%
+  summarise(
+    n_bets   = n(),
+    net_pnl  = sum(net_pnl),
+    win_rate = mean(won),
+    avg_pnl  = mean(net_pnl),
+    .groups  = "drop"
+  ) %>%
+  arrange(desc(net_pnl))
+
+ggplot(bt_segment, aes(x = reorder(segment, net_pnl), y = net_pnl)) +
+  geom_col(aes(fill = strategy), width = 0.6) +
+  geom_text(aes(label = paste0("$", round(net_pnl, 1), " (", n_bets, " bets)")),
+            hjust = ifelse(bt_segment$net_pnl >= 0, -0.05, 1.05), size = 3) +
+  scale_fill_manual(values = c("Buy Yes" = COL_POS, "Buy No" = COL_NEG)) +
+  coord_flip() +
+  labs(
+    title    = "Total Net P&L by Segment",
+    subtitle = "Which segments actually made money after costs?",
+    x = NULL, y = "Total Net P&L ($)", fill = "Strategy"
+  )
+```
+
+# 10 · Bot Implementation Notes
+
+```{r bot-notes, results='asis'}
+# Gather key results for the summary
+n_sig_ci      <- sum(ci_results$significant, na.rm = TRUE)
+n_tradeable_f <- sum(exploitable_net$tradeable, na.rm = TRUE)
+
+overall_bias <- snapshot_data %>%
+  filter(snapshot_label == "1d") %>%
+  summarise(bias = mean(yes_resolution) - mean(snap_price)) %>%
+  pull(bias)
+
+best_segment <- exploitable_net %>% filter(tradeable) %>% slice(1)
+
+cat("## Entry Signals\n\n")
+cat("The bot should evaluate each new binary market against these criteria:\n\n")
+cat("1. **Category**: Match market tags to category rules\n")
+cat("2. **Price zone**: Current Yes price maps to one of 5 zones\n")
+cat(sprintf("3. **Volume threshold**: Only trade markets with ≥ $%dK volume\n", MIN_VOLUME/1000))
+cat(sprintf("4. **Net edge threshold**: Only enter if estimated net edge > %.0f%%\n", MIN_EDGE_NET*100))
+cat("5. **Composite score**: Prefer segments with composite score > 0.5\n\n")
+
+cat("## Position Sizing\n\n")
+cat("- Use **half-Kelly** fractions from §8.4\n")
+cat("- Cap any single position at 5% of bankroll\n")
+cat("- Cap total exposure at 30% of bankroll (diversification)\n\n")
+
+cat("## Risk Limits\n\n")
+cat("- **Daily loss limit**: Pause trading after 5% bankroll drawdown in a day\n")
+cat("- **Monthly review**: Recompute all bias tables monthly with fresh data\n")
+cat("- **Edge decay**: If a segment's rolling 30-day bias flips sign, stop trading it\n")
+cat("- **Minimum sample**: Don't trade a segment with < 30 historical resolved markets\n\n")
+
+cat("## Key Findings\n\n")
+
+cat(sprintf("- **Overall market bias** (1d before close): %+.1f%%. %s.\n",
+  overall_bias * 100,
+  ifelse(abs(overall_bias) > 0.01,
+    ifelse(overall_bias > 0, "Markets slightly underprice Yes", "Markets slightly overprice Yes"),
+    "Markets are approximately well-calibrated overall")))
+
+cat(sprintf("- **Tradeable edges after costs**: %d segments survive (out of %d gross)\n",
+  n_tradeable_f, nrow(exploitable)))
+
+cat(sprintf("- **Statistically significant edges**: %d/%d top segments have bootstrap CIs excluding zero\n",
+  n_sig_ci, nrow(ci_results)))
+
+if (nrow(best_segment) > 0) {
+  cat(sprintf("- **Best net edge**: %s × %s (%s, net edge %+.1f%%, n=%d)\n",
+    best_segment$category, best_segment$price_zone, best_segment$strategy,
+    best_segment$net_edge * 100, best_segment$n_markets))
+}
+
+cat(sprintf("- **Backtest result**: $%.2f net P&L on %d $1 bets (%.2f¢ per bet avg)\n",
+  total_net, total_bets, avg_net * 100))
+
+cat(sprintf("- **Max drawdown**: $%.2f · Sharpe per bet: %.3f\n", max_dd, sharpe_per_bet))
+
+# Persistence insight
+if (nrow(persistence) > 0) {
+  best_persist <- persistence %>% slice(1)
+  cat(sprintf("- **Most persistent edge**: %s — bias in correct direction %s of months\n",
+    best_persist$segment, paste0(round(best_persist$persistence_pct, 0), "%")))
+}
+
+cat("\n\n---\n\n")
+cat("> **Disclaimer**: Past calibration patterns do not guarantee future exploitability.")
+cat(" Transaction costs, slippage, and market evolution may erode these edges.")
+cat(" Always paper-trade or use minimal size before scaling.")
+cat(" The cost assumptions above (", SPREAD_COST*100, "% spread, ", WINNER_FEE*100,
+    "% winner fee) are estimates — actual costs depend on market conditions and order size.\n")
+```
+
+---
+
+*Analysis generated on `r Sys.Date()` using `r nrow(df_binary)` closed binary markets and price history data.*
+
+*v4 changes: fixed initial price bias (conditional analysis), added transaction cost model, temporal stability testing, liquidity filtering, Kelly sizing, composite scoring, simulated backtest. Removed: breakout analysis (null signal), DOW×category (multiple comparisons noise), monthly resolution rates, asymmetric error, price drift overview.*

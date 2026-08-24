@@ -1,0 +1,627 @@
+---
+title: "Polymarket Bias & Mispricing Analysis"
+subtitle: "Closed Markets 2025 — Calibration & Category Mispricings"
+author: "Laurence"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float:
+      collapsed: false
+    code_folding: hide
+    fig_width: 10
+    fig_height: 6
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.align = "center", cache = TRUE
+)
+```
+
+# 1 · Setup & Data Loading
+
+```{r libraries}
+library(arrow)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(jsonlite)
+library(lubridate)
+library(scales)
+library(purrr)
+
+theme_poly <- theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 15),
+    plot.subtitle = element_text(color = "grey40"),
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom"
+  )
+theme_set(theme_poly)
+
+cat("Session memory limit:", round(as.numeric(memory.limit()) / 1024, 1), "GB\n")
+```
+
+```{r load-markets}
+# ── Markets master table ─────────────────────────────────────────────
+df <- read_parquet("C:/Users/laure/PycharmProjects/Polymarket/src/markets_2025_index.parquet")
+
+cat(nrow(df), "market rows loaded\n")
+cat(ncol(df), "columns\n")
+```
+
+## 1.1 Parse Resolutions & Token Mapping
+
+We need to know (a) which token is the "Yes" token and (b) whether that outcome resolved to 1.
+
+```{r parse-resolutions}
+# Helper: safely parse JSON arrays from Polymarket columns
+safe_parse_json <- function(x) {
+  tryCatch(fromJSON(x), error = function(e) NA)
+}
+
+# Parse outcomes, prices, and token IDs
+df_parsed <- df %>%
+  filter(closed == TRUE) %>%
+  rowwise() %>%
+  mutate(
+    outcomes_list = list(tryCatch(fromJSON(outcomes), error = function(e) NA_character_)),
+    prices_list   = list(tryCatch(fromJSON(outcome_prices), error = function(e) NA_character_)),
+    tokens_list   = list(tryCatch(fromJSON(token_ids), error = function(e) NA_character_))
+  ) %>%
+  ungroup()
+
+# Extract Yes token info for binary markets
+df_binary <- df_parsed %>%
+  mutate(
+    n_outcomes    = lengths(outcomes_list),
+    is_binary     = n_outcomes == 2,
+    yes_idx       = map_int(outcomes_list, ~ {
+      idx <- which(tolower(.x) == "yes")
+      if (length(idx) == 1) idx else NA_integer_
+    })
+  ) %>%
+  filter(is_binary, !is.na(yes_idx)) %>%
+  mutate(
+    yes_token_id   = map2_chr(tokens_list, yes_idx, ~ .x[.y]),
+    yes_resolution = map2_dbl(prices_list, yes_idx, ~ as.numeric(.x[.y])),
+    no_idx         = ifelse(yes_idx == 1, 2, 1),
+    no_token_id    = map2_chr(tokens_list, no_idx, ~ .x[.y])
+  ) %>%
+  filter(!is.na(yes_resolution), yes_resolution %in% c(0, 1))
+
+cat(nrow(df_binary), "binary Yes/No markets with clean resolution\n")
+cat("Resolution rate (Yes = 1):", round(mean(df_binary$yes_resolution), 3), "\n")
+```
+
+## 1.2 Derive Categories from Tags
+
+```{r derive-categories}
+# Define category keywords (order matters — first match wins)
+category_rules <- tibble::tribble(
+  ~category,        ~pattern,
+  "Sports",         "nba|nfl|mlb|nhl|soccer|football|tennis|boxing|mma|ufc|cricket|esports|dota|league of legends|sports|epl|la liga|bundesliga|serie a|ligue 1|f1|formula|nascar|golf|olympics|pga",
+  "Crypto",         "crypto|bitcoin|btc|ethereum|eth|solana|sol|defi|blockchain|token|nft|altcoin|memecoin|binance|coinbase",
+  "Politics",       "politic|election|trump|biden|democrat|republican|congress|senate|governor|president|vote|gop|dnc|rnc|parliament|minister|legislation|bill|law|executive order",
+  "Economics",      "econom|fed |federal reserve|interest rate|inflation|gdp|employment|jobs|recession|tariff|trade|stock market|s&p|nasdaq|dow jones|treasury|debt|cpi",
+  "Science/Tech",   "science|tech|ai |artificial intelligence|openai|google|apple|microsoft|space|spacex|nasa|climate|weather|earthquake|hurricane|temperature",
+  "Entertainment",  "movie|film|oscar|grammy|emmy|music|album|box office|streaming|netflix|youtube|tiktok|celebrity|award|tv show|series",
+  "World Events",   "war|conflict|ukraine|russia|china|israel|gaza|nato|united nations|refugee|disaster|pandemic",
+  "Other",          ".*"
+)
+
+assign_category <- function(tags, series_slug = NA_character_) {
+  if (is.na(tags) || tags == "") return("Other")
+  combined <- tolower(tags)
+  for (i in seq_len(nrow(category_rules))) {
+    if (str_detect(combined, category_rules$pattern[i])) {
+      return(category_rules$category[i])
+    }
+  }
+  return("Other")
+}
+
+df_binary <- df_binary %>%
+  mutate(category = map_chr(event_tags, assign_category))
+
+cat("\n── Category distribution ──\n")
+df_binary %>% count(category, sort = TRUE) %>% print()
+```
+
+# 2 · Calibration Analysis (Snapshot Prices)
+
+The core question: **When the market prices a Yes token at probability $p$, does the event actually happen $p$% of the time?**
+
+We use the price history to sample market prices at fixed intervals before resolution, then check calibration.
+
+```{r load-price-history}
+# ── Open the price history lazily with Arrow ─────────────────────────
+# We only need rows matching our binary market yes-tokens
+yes_tokens <- unique(df_binary$yes_token_id)
+
+# Read lazily, filter, collect
+cat("Opening price history (lazy)...\n")
+dfp_arrow <- open_dataset("C:/Users/laure/PycharmProjects/Polymarket/src/markets_2025_closed_price_history.parquet")
+
+cat("Filtering to", length(yes_tokens), "Yes tokens...\n")
+# Collect in batches to manage memory — filter by token_id
+dfp <- dfp_arrow %>%
+  filter(token_id %in% yes_tokens) %>%
+  select(token_id, timestamp, price) %>%
+  collect()
+
+cat(nrow(dfp), "price history rows for binary Yes tokens\n")
+gc()
+```
+
+```{r compute-time-snapshots}
+# Join resolution info onto price history
+token_lookup <- df_binary %>%
+  select(yes_token_id, yes_resolution, id, event_title, category,
+         closed_time, volume_num) %>%
+  rename(token_id = yes_token_id)
+
+# Parse closed_time
+token_lookup <- token_lookup %>%
+  mutate(closed_dt = ymd_hms(closed_time, quiet = TRUE))
+
+dfp <- dfp %>%
+  inner_join(token_lookup, by = "token_id")
+
+# Compute hours before close
+dfp <- dfp %>%
+  mutate(hours_before_close = as.numeric(difftime(closed_dt, timestamp, units = "hours")))
+
+# Define snapshot windows
+snapshots <- c(1, 6, 24, 72, 168, 720)  # hours before close
+snapshot_labels <- c("1h", "6h", "1d", "3d", "1w", "1mo")
+
+# For each market-token, find the price closest to each snapshot
+get_snapshot_price <- function(hbc, price, target_hours) {
+  # hbc = hours_before_close vector, price = price vector
+  diffs <- abs(hbc - target_hours)
+  # Only consider observations within a reasonable window
+  valid <- diffs < (target_hours * 0.5 + 1)
+  if (!any(valid)) return(NA_real_)
+  price[valid][which.min(diffs[valid])]
+}
+
+cat("Computing snapshot prices for", length(snapshots), "time horizons...\n")
+
+snapshot_data <- dfp %>%
+  filter(hours_before_close >= 0) %>%  # only pre-close prices
+  group_by(token_id, id, yes_resolution, category, volume_num) %>%
+  summarise(
+    across_snapshots = list(tibble(
+      snapshot_hours = snapshots,
+      snapshot_label = snapshot_labels,
+      snap_price = map_dbl(snapshots, ~ get_snapshot_price(hours_before_close, price, .x))
+    )),
+    .groups = "drop"
+  ) %>%
+  unnest(across_snapshots) %>%
+  filter(!is.na(snap_price))
+
+cat(nrow(snapshot_data), "market × snapshot observations\n")
+rm(dfp); gc()
+```
+
+## 2.1 Overall Calibration Curve
+
+```{r calibration-curve-overall, fig.height=7, fig.width=10}
+# Bin prices into deciles for each snapshot
+calibration <- snapshot_data %>%
+  mutate(
+    price_bin = cut(snap_price, breaks = seq(0, 1, by = 0.05),
+                    include.lowest = TRUE, labels = FALSE),
+    bin_midpoint = (price_bin - 1) * 0.05 + 0.025
+  ) %>%
+  filter(!is.na(price_bin)) %>%
+  group_by(snapshot_label, bin_midpoint) %>%
+  summarise(
+    n          = n(),
+    actual_pct = mean(yes_resolution),
+    avg_price  = mean(snap_price),
+    .groups    = "drop"
+  ) %>%
+  # Set factor order for snapshots
+
+  mutate(snapshot_label = factor(snapshot_label,
+                                 levels = c("1mo", "1w", "3d", "1d", "6h", "1h")))
+
+ggplot(calibration %>% filter(n >= 20),
+       aes(x = avg_price, y = actual_pct)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.8) +
+  geom_point(aes(size = n, color = snapshot_label), alpha = 0.7) +
+  geom_smooth(aes(color = snapshot_label, weight = n), method = "loess",
+              se = FALSE, linewidth = 1) +
+  scale_x_continuous(labels = percent, limits = c(0, 1)) +
+  scale_y_continuous(labels = percent, limits = c(0, 1)) +
+  scale_size_continuous(range = c(1, 6), guide = "none") +
+  labs(
+    title    = "Polymarket Calibration Curve — Closed Binary Markets (2025)",
+    subtitle = "Dashed line = perfect calibration · Each point = price bin at N hours before close",
+    x = "Market Price (Implied Probability)",
+    y = "Actual Resolution Rate",
+    color = "Snapshot"
+  ) +
+  coord_equal()
+```
+
+## 2.2 Calibration Error by Snapshot Horizon
+
+```{r calibration-error-summary}
+# Brier-style calibration error per snapshot
+cal_error <- snapshot_data %>%
+  mutate(price_bin = round(snap_price * 20) / 20) %>%  # 5% bins
+  group_by(snapshot_label, price_bin) %>%
+  summarise(
+    n = n(),
+    actual = mean(yes_resolution),
+    predicted = mean(snap_price),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 10) %>%
+  group_by(snapshot_label) %>%
+  summarise(
+    weighted_cal_error = weighted.mean(abs(actual - predicted), w = n),
+    n_bins = n(),
+    total_obs = sum(n),
+    .groups = "drop"
+  ) %>%
+  mutate(snapshot_label = factor(snapshot_label,
+                                  levels = c("1mo", "1w", "3d", "1d", "6h", "1h")))
+
+ggplot(cal_error, aes(x = snapshot_label, y = weighted_cal_error)) +
+  geom_col(aes(fill = weighted_cal_error), width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = paste0(round(weighted_cal_error * 100, 1), "%")),
+            vjust = -0.5, fontface = "bold", size = 4) +
+  scale_fill_gradient(low = "#2ecc71", high = "#e74c3c") +
+  scale_y_continuous(labels = percent, expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title = "Average Calibration Error by Time Before Resolution",
+    subtitle = "Lower = more accurate prices · Weighted by bin size",
+    x = "Time Before Close", y = "Mean Absolute Calibration Error"
+  )
+```
+
+## 2.3 Favorite–Longshot Bias (within Calibration)
+
+Even if overall calibration looks good, a **favorite–longshot bias** means longshots (low probability) are overpriced and favorites (high probability) are underpriced — or vice versa.
+
+```{r favorite-longshot, fig.height=6}
+# Use 1-day-before-close snapshot for cleanest signal
+fl_data <- snapshot_data %>%
+  filter(snapshot_label == "1d") %>%
+  mutate(
+    price_bin = cut(snap_price, breaks = seq(0, 1, by = 0.05),
+                    include.lowest = TRUE, labels = FALSE),
+    bin_midpoint = (price_bin - 1) * 0.05 + 0.025
+  ) %>%
+  filter(!is.na(price_bin)) %>%
+  group_by(bin_midpoint) %>%
+  summarise(
+    n = n(),
+    actual = mean(yes_resolution),
+    predicted = mean(snap_price),
+    bias = actual - predicted,  # positive = underpriced (actual > market price)
+    .groups = "drop"
+  )
+
+ggplot(fl_data %>% filter(n >= 15), aes(x = bin_midpoint, y = bias)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_col(aes(fill = bias), width = 0.04, show.legend = FALSE) +
+  geom_text(aes(label = n, y = ifelse(bias >= 0, bias + 0.008, bias - 0.008)),
+            size = 2.8, color = "grey40") +
+  scale_fill_gradient2(low = "#e74c3c", mid = "grey80", high = "#2ecc71", midpoint = 0) +
+  scale_x_continuous(labels = percent) +
+  scale_y_continuous(labels = percent) +
+  labs(
+    title    = "Favorite–Longshot Bias — 1 Day Before Close",
+    subtitle = "Green = market underprices (buy opportunity) · Red = market overprices · Numbers = market count",
+    x = "Market Price Bin (1 day before close)",
+    y = "Bias (Actual Resolution − Market Price)"
+  )
+```
+
+# 3 · Category-Level Mispricings
+
+## 3.1 Category Calibration Curves
+
+```{r category-calibration, fig.height=10, fig.width=12}
+# Use 1-day snapshot for category analysis
+cat_cal <- snapshot_data %>%
+  filter(snapshot_label == "1d") %>%
+  mutate(
+    price_bin = cut(snap_price, breaks = seq(0, 1, by = 0.10),
+                    include.lowest = TRUE, labels = FALSE),
+    bin_midpoint = (price_bin - 1) * 0.10 + 0.05
+  ) %>%
+  filter(!is.na(price_bin)) %>%
+  group_by(category, bin_midpoint) %>%
+  summarise(
+    n      = n(),
+    actual = mean(yes_resolution),
+    predicted = mean(snap_price),
+    .groups = "drop"
+  )
+
+ggplot(cat_cal %>% filter(n >= 10),
+       aes(x = predicted, y = actual)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey60") +
+  geom_point(aes(size = n), color = "#3498db", alpha = 0.7) +
+  geom_smooth(aes(weight = n), method = "loess", se = FALSE,
+              color = "#e74c3c", linewidth = 1) +
+  facet_wrap(~ category, ncol = 3) +
+  scale_x_continuous(labels = percent, limits = c(0, 1)) +
+  scale_y_continuous(labels = percent, limits = c(0, 1)) +
+  scale_size_continuous(range = c(1.5, 5), guide = "none") +
+  coord_equal() +
+  labs(
+    title = "Calibration by Category — 1 Day Before Close",
+    subtitle = "Red line = actual calibration · Dashed = perfect · Bubble size = # markets",
+    x = "Market Price (Implied Probability)",
+    y = "Actual Resolution Rate"
+  )
+```
+
+## 3.2 Category Bias Heatmap
+
+```{r category-bias-heatmap, fig.height=7, fig.width=10}
+cat_bias <- snapshot_data %>%
+  filter(snapshot_label == "1d") %>%
+  mutate(
+    price_zone = case_when(
+      snap_price <= 0.15 ~ "Longshot (0-15%)",
+      snap_price <= 0.35 ~ "Unlikely (15-35%)",
+      snap_price <= 0.65 ~ "Toss-up (35-65%)",
+      snap_price <= 0.85 ~ "Likely (65-85%)",
+      TRUE               ~ "Favorite (85-100%)"
+    ),
+    price_zone = factor(price_zone, levels = c(
+      "Longshot (0-15%)", "Unlikely (15-35%)", "Toss-up (35-65%)",
+      "Likely (65-85%)", "Favorite (85-100%)"
+    ))
+  ) %>%
+  group_by(category, price_zone) %>%
+  summarise(
+    n    = n(),
+    bias = mean(yes_resolution) - mean(snap_price),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 10)
+
+ggplot(cat_bias, aes(x = price_zone, y = category, fill = bias)) +
+  geom_tile(color = "white", linewidth = 1) +
+  geom_text(aes(label = paste0(ifelse(bias > 0, "+", ""),
+                                round(bias * 100, 1), "%\n(n=", n, ")")),
+            size = 3.2, fontface = "bold") +
+  scale_fill_gradient2(
+    low = "#e74c3c", mid = "white", high = "#2ecc71", midpoint = 0,
+    labels = percent, name = "Bias"
+  ) +
+  labs(
+    title    = "Category × Price Zone Bias Heatmap — 1 Day Before Close",
+    subtitle = "Green = underpriced (profitable to buy Yes) · Red = overpriced (profitable to buy No)",
+    x = NULL, y = NULL
+  ) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+## 3.3 Aggregate Category Bias & Brier Score
+
+```{r category-aggregate-stats}
+cat_stats <- snapshot_data %>%
+  filter(snapshot_label == "1d") %>%
+  group_by(category) %>%
+  summarise(
+    n_markets       = n(),
+    avg_price       = mean(snap_price),
+    resolution_rate = mean(yes_resolution),
+    bias            = mean(yes_resolution) - mean(snap_price),
+    brier_score     = mean((snap_price - yes_resolution)^2),
+    abs_bias        = mean(abs(yes_resolution - snap_price)),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(abs(bias)))
+
+cat_stats %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4))) %>%
+  knitr::kable(caption = "Category-Level Bias & Accuracy (1 day before close)")
+```
+
+```{r category-bias-bar, fig.height=5}
+ggplot(cat_stats %>% filter(n_markets >= 20),
+       aes(x = reorder(category, bias), y = bias)) +
+  geom_col(aes(fill = bias), width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = paste0(ifelse(bias > 0, "+", ""),
+                                round(bias * 100, 1), "%"),
+                y = bias + sign(bias) * 0.003),
+            fontface = "bold", size = 4) +
+  scale_fill_gradient2(low = "#e74c3c", mid = "grey80", high = "#2ecc71", midpoint = 0) +
+  scale_y_continuous(labels = percent) +
+  coord_flip() +
+  labs(
+    title    = "Net Calibration Bias by Category",
+    subtitle = "Positive = events happen MORE often than the market thinks (buy Yes)",
+    x = NULL, y = "Bias (Actual − Predicted)"
+  )
+```
+
+# 4 · Volume-Weighted Analysis
+
+Thin markets are noisier. Let's check if bias patterns change when we weight by volume.
+
+```{r volume-weighted-calibration, fig.height=6}
+vol_cal <- snapshot_data %>%
+  filter(snapshot_label == "1d", !is.na(volume_num)) %>%
+  mutate(
+    vol_tier = case_when(
+      volume_num < 1000    ~ "Micro (<$1K)",
+      volume_num < 10000   ~ "Small ($1K-$10K)",
+      volume_num < 100000  ~ "Medium ($10K-$100K)",
+      TRUE                 ~ "Large (>$100K)"
+    ),
+    vol_tier = factor(vol_tier, levels = c(
+      "Micro (<$1K)", "Small ($1K-$10K)", "Medium ($10K-$100K)", "Large (>$100K)"
+    )),
+    price_bin = round(snap_price * 10) / 10
+  ) %>%
+  group_by(vol_tier, price_bin) %>%
+  summarise(
+    n      = n(),
+    actual = mean(yes_resolution),
+    predicted = mean(snap_price),
+    .groups = "drop"
+  )
+
+ggplot(vol_cal %>% filter(n >= 10),
+       aes(x = predicted, y = actual)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey60") +
+  geom_point(aes(size = n), color = "#9b59b6", alpha = 0.7) +
+  geom_smooth(aes(weight = n), method = "loess", se = FALSE,
+              color = "#e67e22", linewidth = 1) +
+  facet_wrap(~ vol_tier, ncol = 2) +
+  scale_x_continuous(labels = percent, limits = c(0, 1)) +
+  scale_y_continuous(labels = percent, limits = c(0, 1)) +
+  scale_size_continuous(range = c(1, 5), guide = "none") +
+  coord_equal() +
+  labs(
+    title = "Calibration by Market Volume Tier",
+    subtitle = "Do thinner markets have worse calibration?",
+    x = "Market Price", y = "Actual Resolution Rate"
+  )
+```
+
+```{r volume-brier}
+vol_brier <- snapshot_data %>%
+  filter(snapshot_label == "1d", !is.na(volume_num)) %>%
+  mutate(
+    vol_tier = case_when(
+      volume_num < 1000    ~ "Micro (<$1K)",
+      volume_num < 10000   ~ "Small ($1K-$10K)",
+      volume_num < 100000  ~ "Medium ($10K-$100K)",
+      TRUE                 ~ "Large (>$100K)"
+    ),
+    vol_tier = factor(vol_tier, levels = c(
+      "Micro (<$1K)", "Small ($1K-$10K)", "Medium ($10K-$100K)", "Large (>$100K)"
+    )),
+    brier = (snap_price - yes_resolution)^2
+  ) %>%
+  group_by(vol_tier) %>%
+  summarise(
+    n = n(),
+    brier_score = mean(brier),
+    bias = mean(yes_resolution - snap_price),
+    .groups = "drop"
+  )
+
+vol_brier %>%
+  mutate(across(where(is.numeric) & !n, ~ round(.x, 4))) %>%
+  knitr::kable(caption = "Brier Score & Bias by Volume Tier")
+```
+
+# 5 · Exploitable Pattern Summary
+
+```{r summary-table}
+# Find the most exploitable category × price zone combos
+exploitable <- snapshot_data %>%
+  filter(snapshot_label == "1d") %>%
+  mutate(
+    price_zone = case_when(
+      snap_price <= 0.15 ~ "Longshot (0-15%)",
+      snap_price <= 0.35 ~ "Unlikely (15-35%)",
+      snap_price <= 0.65 ~ "Toss-up (35-65%)",
+      snap_price <= 0.85 ~ "Likely (65-85%)",
+      TRUE               ~ "Favorite (85-100%)"
+    )
+  ) %>%
+  group_by(category, price_zone) %>%
+  summarise(
+    n_markets   = n(),
+    avg_price   = mean(snap_price),
+    actual_rate = mean(yes_resolution),
+    bias        = mean(yes_resolution) - mean(snap_price),
+    edge_pct    = bias / avg_price * 100,  # % return on implied price
+    brier       = mean((snap_price - yes_resolution)^2),
+    .groups     = "drop"
+  ) %>%
+  filter(n_markets >= 15, abs(bias) > 0.03) %>%
+  arrange(desc(abs(bias)))
+
+exploitable %>%
+  mutate(across(where(is.numeric) & !n_markets, ~ round(.x, 3))) %>%
+  head(20) %>%
+  knitr::kable(caption = "Top 20 Most Exploitable Category × Price Zone Combinations (|bias| > 3%, n ≥ 15)")
+```
+
+```{r roi-plot, fig.height=6}
+# Simulated P&L if you always bet $1 on the bias direction
+exploitable_pl <- exploitable %>%
+  mutate(
+    strategy = ifelse(bias > 0, "Buy Yes", "Buy No"),
+    # Simplified expected P&L per $1 bet
+    expected_pl = ifelse(bias > 0,
+                         actual_rate * (1 / avg_price - 1) - (1 - actual_rate),
+                         (1 - actual_rate) * (1 / (1 - avg_price) - 1) - actual_rate),
+    label = paste(category, price_zone, sep = "\n")
+  )
+
+ggplot(exploitable_pl %>% head(15),
+       aes(x = reorder(label, expected_pl), y = expected_pl)) +
+  geom_col(aes(fill = strategy), width = 0.6) +
+  geom_text(aes(label = paste0(round(expected_pl * 100, 1), "¢/$1")),
+            hjust = ifelse(exploitable_pl$expected_pl[1:min(15, nrow(exploitable_pl))] >= 0, -0.1, 1.1),
+            size = 3.3, fontface = "bold") +
+  scale_fill_manual(values = c("Buy Yes" = "#2ecc71", "Buy No" = "#e74c3c")) +
+  scale_y_continuous(labels = function(x) paste0(round(x * 100, 1), "¢")) +
+  coord_flip() +
+  labs(
+    title    = "Expected P&L per $1 Bet — Top Exploitable Segments",
+    subtitle = "Based on historical calibration bias in closed 2025 markets",
+    x = NULL, y = "Expected Profit per $1 Wagered",
+    fill = "Strategy"
+  )
+```
+
+# 6 · Key Takeaways
+
+```{r takeaways, results='asis'}
+# Auto-generate key findings
+overall_bias <- snapshot_data %>%
+  filter(snapshot_label == "1d") %>%
+  summarise(bias = mean(yes_resolution) - mean(snap_price)) %>%
+  pull(bias)
+
+worst_cat <- cat_stats %>% slice_max(abs(bias), n = 1)
+best_cat  <- cat_stats %>% slice_min(brier_score, n = 1)
+
+cat("## Automated Findings\n\n")
+cat(sprintf("- **Overall market bias**: %+.1f%% (1 day before close). %s.\n",
+            overall_bias * 100,
+            ifelse(overall_bias > 0.01, "Markets slightly underprice Yes outcomes",
+                   ifelse(overall_bias < -0.01, "Markets slightly overprice Yes outcomes",
+                          "Markets are approximately well-calibrated overall"))))
+cat(sprintf("- **Most biased category**: %s (%+.1f%% bias, n=%d)\n",
+            worst_cat$category, worst_cat$bias * 100, worst_cat$n_markets))
+cat(sprintf("- **Best calibrated category**: %s (Brier score: %.4f)\n",
+            best_cat$category, best_cat$brier_score))
+
+top_exploit <- exploitable %>% slice(1)
+if (nrow(top_exploit) > 0) {
+  cat(sprintf("- **Largest exploitable edge**: %s × %s (%+.1f%% bias, n=%d)\n",
+              top_exploit$category, top_exploit$price_zone,
+              top_exploit$bias * 100, top_exploit$n_markets))
+}
+
+cat("\n\n> **Disclaimer**: Past calibration patterns do not guarantee future exploitability. Transaction costs, slippage, and market evolution may erode these edges.\n")
+```
+
+---
+
+*Analysis generated on `r Sys.Date()` using `r nrow(df_binary)` closed binary markets and price history data.*
