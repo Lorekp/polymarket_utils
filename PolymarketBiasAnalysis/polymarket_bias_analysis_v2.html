@@ -2898,7 +2898,7 @@ theme_set(theme_poly)
 COL_POS  &lt;- &quot;#2ecc71&quot;
 COL_NEG  &lt;- &quot;#e74c3c&quot;
 COL_NEUT &lt;- &quot;grey70&quot;</code></pre>
-<pre class="r"><code>df &lt;- read_parquet(&quot;C:/Users/laure/PycharmProjects/Polymarket/src/markets_2025_closed.parquet&quot;)
+<pre class="r"><code>df &lt;- read_parquet(&quot;../data/markets_2025_closed.parquet&quot;)
 cat(nrow(df), &quot;market rows loaded\n&quot;)</code></pre>
 <pre><code>## 111178 market rows loaded</code></pre>
 <pre class="r"><code>cat(ncol(df), &quot;columns\n&quot;)</code></pre>
@@ -3011,7 +3011,7 @@ yes_tokens &lt;- unique(token_lookup$token_id)
 cat(length(yes_tokens), &quot;unique Yes tokens to look up\n&quot;)</code></pre>
 <pre><code>## 49753 unique Yes tokens to look up</code></pre>
 <pre class="r"><code>dfp_arrow &lt;- open_dataset(
-  &quot;C:/Users/laure/PycharmProjects/Polymarket/src/markets_2025_closed_price_history.parquet&quot;
+  &quot;../data/markets_2025_closed_price_history.parquet&quot;
 )
 
 snapshots       &lt;- c(1, 6, 24, 72, 168, 720)
@@ -3809,7 +3809,7 @@ exploitable by a rule-based trading bot.</p>
 <pre class="r"><code>library(data.table)
 
 dfp_arrow2 &lt;- open_dataset(
-  &quot;C:/Users/laure/PycharmProjects/Polymarket/src/markets_2025_closed_price_history.parquet&quot;
+  &quot;../data/markets_2025_closed_price_history.parquet&quot;
 )
 
 valid_tokens &lt;- market_stats %&gt;%

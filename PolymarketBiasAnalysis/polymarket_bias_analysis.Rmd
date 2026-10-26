@@ -49,7 +49,7 @@ cat("Session memory limit:", round(as.numeric(memory.limit()) / 1024, 1), "GB\n"
 
 ```{r load-markets}
 # ── Markets master table ─────────────────────────────────────────────
-df <- read_parquet("C:/Users/laure/PycharmProjects/Polymarket/src/markets_2025_index.parquet")
+df <- read_parquet(file.path(Sys.getenv("POLYMARKET_DATA_DIR", unset = "../data"), "markets_2025_index.parquet"))
 
 cat(nrow(df), "market rows loaded\n")
 cat(ncol(df), "columns\n")
@@ -146,7 +146,7 @@ yes_tokens <- unique(df_binary$yes_token_id)
 
 # Read lazily, filter, collect
 cat("Opening price history (lazy)...\n")
-dfp_arrow <- open_dataset("C:/Users/laure/PycharmProjects/Polymarket/src/markets_2025_closed_price_history.parquet")
+dfp_arrow <- open_dataset(file.path(Sys.getenv("POLYMARKET_DATA_DIR", unset = "../data"), "markets_2025_closed_price_history.parquet"))
 
 cat("Filtering to", length(yes_tokens), "Yes tokens...\n")
 # Collect in batches to manage memory — filter by token_id

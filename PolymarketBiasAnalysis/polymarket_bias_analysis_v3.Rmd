@@ -52,7 +52,7 @@ COL_NEUT <- "grey70"
 ```
 
 ```{r load-markets}
-df <- read_parquet("C:/Users/laure/PycharmProjects/Polymarket/src/markets_2025_closed.parquet")
+df <- read_parquet(file.path(Sys.getenv("POLYMARKET_DATA_DIR", unset = "../data"), "markets_2025_closed.parquet"))
 cat(nrow(df), "market rows loaded\n")
 cat(ncol(df), "columns\n")
 ```
@@ -152,7 +152,7 @@ cat(length(yes_tokens), "unique Yes tokens to look up\n")
 
 ```{r compute-time-snapshots, cache=TRUE}
 dfp_arrow <- open_dataset(
-  "C:/Users/laure/PycharmProjects/Polymarket/src/markets_2025_closed_price_history.parquet"
+  file.path(Sys.getenv("POLYMARKET_DATA_DIR", unset = "../data"), "markets_2025_closed_price_history.parquet")
 )
 
 snapshots       <- c(1, 6, 24, 72, 168, 720)
@@ -733,7 +733,7 @@ vol_brier %>%
 library(data.table)
 
 dfp_arrow2 <- open_dataset(
-  "C:/Users/laure/PycharmProjects/Polymarket/src/markets_2025_closed_price_history.parquet"
+  file.path(Sys.getenv("POLYMARKET_DATA_DIR", unset = "../data"), "markets_2025_closed_price_history.parquet")
 )
 
 valid_tokens <- market_stats %>%

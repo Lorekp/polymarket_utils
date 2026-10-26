@@ -47,7 +47,7 @@ theme_set(theme_poly)
 
 ```{r load-markets}
 # ── Markets master table ─────────────────────────────────────────────
-df <- read_parquet("C:/Users/laure/PycharmProjects/Polymarket/src/markets_2025_index.parquet")
+df <- read_parquet(file.path(Sys.getenv("POLYMARKET_DATA_DIR", unset = "../data"), "markets_2025_index.parquet"))
 
 cat(nrow(df), "market rows loaded\n")
 cat(ncol(df), "columns\n")
@@ -156,7 +156,7 @@ cat(length(yes_tokens), "unique Yes tokens to look up\n")
 # then rbind only the small snapshot results.
 
 dfp_arrow <- open_dataset(
-  "C:/Users/laure/PycharmProjects/Polymarket/src/markets_2025_closed_price_history.parquet"
+  file.path(Sys.getenv("POLYMARKET_DATA_DIR", unset = "../data"), "markets_2025_closed_price_history.parquet")
 )
 
 snapshots      <- c(1, 6, 24, 72, 168, 720)

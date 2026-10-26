@@ -26,7 +26,7 @@ knitr::opts_chunk$set(
 
 ```{r config}
 # ── Paths (change these once) ─────────────────────────────────────────────
-DATA_DIR   <- "C:/Users/laure/PycharmProjects/Polymarket/src"
+DATA_DIR   <- Sys.getenv("POLYMARKET_DATA_DIR", unset = "../data")
 MARKET_FILE <- file.path(DATA_DIR, "markets_2025_closed.parquet")
 PRICE_FILE  <- file.path(DATA_DIR, "markets_2025_closed_price_history.parquet")
 

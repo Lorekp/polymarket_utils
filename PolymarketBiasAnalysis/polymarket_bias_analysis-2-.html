@@ -2893,7 +2893,7 @@ theme_poly &lt;- theme_minimal(base_size = 13) +
   )
 theme_set(theme_poly)</code></pre>
 <pre class="r"><code># ── Markets master table ─────────────────────────────────────────────
-df &lt;- read_parquet(&quot;C:/Users/laure/PycharmProjects/Polymarket/src/markets_2025_index.parquet&quot;)
+df &lt;- read_parquet(&quot;../data/markets_2025_index.parquet&quot;)
 
 cat(nrow(df), &quot;market rows loaded\n&quot;)</code></pre>
 <pre><code>## 111178 market rows loaded</code></pre>
@@ -3013,7 +3013,7 @@ cat(length(yes_tokens), &quot;unique Yes tokens to look up\n&quot;)</code></pre>
 # then rbind only the small snapshot results.
 
 dfp_arrow &lt;- open_dataset(
-  &quot;C:/Users/laure/PycharmProjects/Polymarket/src/markets_2025_closed_price_history.parquet&quot;
+  &quot;../data/markets_2025_closed_price_history.parquet&quot;
 )
 
 snapshots      &lt;- c(1, 6, 24, 72, 168, 720)

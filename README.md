@@ -76,7 +76,9 @@ Stop the simulation with `Ctrl+C`. Launch the analyzer to inspect saved sessions
 
 Historical prices are time-indexed, but market metadata such as volume and liquidity comes from downloaded snapshots. The replay is not a reconstruction of historical order books or guaranteed point-in-time metadata. Its execution engine applies fixed 0.5% entry slippage and simplifies fills and settlement. Reported returns therefore require independent checks for selection bias, future information, costs, and execution feasibility.
 
-The R studies require R, their declared packages, and external market/history files. Update their `DATA_DIR` configuration before rendering. No R environment lockfile is provided; the checked-in rendered reports can be read without rerunning the analyses.
+The R studies require R, their declared packages, and external market/history files. Their source files read from `../data` relative to `PolymarketBiasAnalysis/`, or from the directory set in `POLYMARKET_DATA_DIR`. Use matching 2025 files for those studies; the Python downloader example above selects 2023 and must be adjusted to collect another period. No R environment lockfile is provided.
+
+The checked-in HTML/PDF reports are historical research outputs, not newly reproduced results. Personal workstation paths in the R Markdown and HTML examples were made portable for publication; numerical results were not recomputed. The original PDFs remain as historical exports and may show the old local paths.
 
 No automated test suite or CI workflow is included in this snapshot, although `pytest` appears in the requirements. There is no established passing test command or bundled smoke dataset.
 
